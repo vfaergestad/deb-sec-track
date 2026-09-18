@@ -824,6 +824,13 @@ def main() -> None:
     started = time.time()
     args.cache.mkdir(parents=True, exist_ok=True)
 
+    # GitHub Pages reports a custom domain's base URL as http:// until
+    # "Enforce HTTPS" is switched on, which would leave every feed link
+    # pointing at a redirect.  Pages always serves https, so normalise.
+    if args.base_url.startswith("http://"):
+        args.base_url = "https://" + args.base_url[len("http://"):]
+        log(f"base URL upgraded to {args.base_url}")
+
     debian_path = download(
         DEBIAN_JSON_URL, args.cache / "debian-tracker.json", args.offline
     )
