@@ -475,6 +475,9 @@ def load_epss(cache: Path, offline: bool) -> tuple[dict[str, tuple[float, float]
 ADVISORY_HEADER = re.compile(
     r"^\[(?P<date>[^\]]+)\]\s+(?P<id>D[SL]A-[\w.-]+)\s+(?P<pkg>\S+)"
 )
+ADVISORY_RELEASE = re.compile(
+    r"^\[(?P<suite>[a-z-]+)\]\s*-\s*(?P<pkg>\S+)\s+(?P<version>\S+)"
+)
 
 
 def load_advisories(cache: Path, offline: bool) -> dict[str, list[dict]]:
@@ -506,13 +509,22 @@ def load_advisories(cache: Path, offline: bool) -> dict[str, list[dict]]:
                         "kind": kind,
                         "date": when,
                         "package": pkg,
+                        "releases": {},
                     }
                 continue
             stripped = line.strip()
-            if current and stripped.startswith("{") and stripped.endswith("}"):
+            if not current:
+                continue
+            if stripped.startswith("{") and stripped.endswith("}"):
                 for cve in stripped[1:-1].split():
                     if cve.startswith("CVE-"):
                         out.setdefault(cve, []).append(current)
+            else:
+                # "[bookworm] - linux 6.1.158-1": which suite this advisory
+                # actually shipped to, and at what version.
+                rel = ADVISORY_RELEASE.match(stripped)
+                if rel:
+                    current["releases"][rel.group("suite")] = rel.group("version")
     for entries in out.values():
         entries.sort(key=lambda a: a["date"], reverse=True)
     log(f"Debian advisories: {len(out)} CVEs covered by a DSA or DLA")
@@ -680,6 +692,18 @@ def assemble(
         epss_entry = epss.get(cve)
         advs = advisories.get(cve, [])
 
+        # The advisory that actually shipped the fix to each suite, which is
+        # the only firm "this was fixed on <date>" the archive gives us.
+        fix_dates, fix_ids = [], []
+        for col in columns:
+            hit = ""
+            for adv in sorted(advs, key=lambda a: a["date"]):
+                if adv["package"] == col["package"] and col["suite"] in adv["releases"]:
+                    hit = adv
+                    break
+            fix_dates.append(hit["date"] if hit else "")
+            fix_ids.append(hit["id"] if hit else "")
+
         deb = packages["linux"].get(cve) or packages.get("linux-6.12", {}).get(cve, {})
         summary = rec.get("title") or first_sentence(deb.get("description", "")) or cve
 
@@ -711,6 +735,9 @@ def assemble(
             row["epct"] = round(epss_entry[1], 5)
         if advs:
             row["adv"] = advs[0]["id"]
+        if any(fix_dates):
+            row["fd"] = fix_dates
+            row["fa"] = fix_ids
         if area:
             row["area"] = area
         if vector:
@@ -753,6 +780,38 @@ def first_sentence(text: str, limit: int = 160) -> str:
     if 0 < cut < limit:
         return text[:cut]
     return text[:limit].rstrip() + ("…" if len(text) > limit else "")
+
+
+def fix_lag(rows: list[dict], columns: list[dict]) -> dict:
+    """Days from CVE publication to the advisory that fixed it, per column.
+
+    Only advisory-fixed CVEs have a firm fix date, so this measures the
+    security-update path - which is the one that matters when you are waiting
+    on a fix for a release you run.
+    """
+    out = {}
+    for idx, col in enumerate(columns):
+        lags = []
+        for row in rows:
+            if not row.get("pub") or not row.get("fd"):
+                continue
+            when = row["fd"][idx]
+            if not when:
+                continue
+            fixed = datetime.strptime(when, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            days = (fixed.timestamp() - row["pub"]) / 86400
+            if days >= 0:
+                lags.append(days)
+        lags.sort()
+        if lags:
+            out[col["id"]] = {
+                "n": len(lags),
+                "median": round(lags[len(lags) // 2]),
+                "p90": round(lags[min(len(lags) - 1, int(len(lags) * 0.9))]),
+            }
+        else:
+            out[col["id"]] = {"n": 0}
+    return out
 
 
 def counts_per_column(rows: list[dict], columns: list[dict]) -> dict:
@@ -884,6 +943,7 @@ def main() -> None:
         "chunks": len(chunks),
         "total": len(rows),
         "counts": counts_per_column(rows, columns),
+        "fix_lag": fix_lag(rows, columns),
         "sources": {
             "debian": "https://security-tracker.debian.org/tracker/source-package/linux",
             "kernel": "https://git.kernel.org/pub/scm/linux/security/vulns.git",

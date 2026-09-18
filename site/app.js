@@ -1,18 +1,91 @@
 /* Debian Linux kernel CVE tracker.
  *
- * Everything the page shows comes out of site/data/, which scripts/build.py
- * regenerates from the Debian Security Tracker, the kernel CNA's vulns.git,
- * CISA KEV and FIRST EPSS.  No scoring or guessing happens here: the page
- * filters, sorts and renders published values.
+ * The page answers one workflow: a kernel CVE landed - is the release I run
+ * exposed, how urgent is it, and when does the fix arrive?  Everything it
+ * shows comes out of site/data/, which scripts/build.py regenerates from the
+ * Debian Security Tracker, the kernel CNA's vulns.git, CISA KEV and FIRST
+ * EPSS.  No scoring happens here; the page filters, sorts and renders
+ * published values.
  */
 'use strict';
 
-const BATCH = 60;           // rows rendered per scroll batch
+const BATCH = 60;
+const DAY = 86400;
+const NEW_WINDOW = 30;    // days that count as "new"
+const FIXED_WINDOW = 90;  // days back that "recently fixed" covers
+
+// The bar for "needs attention": in CISA KEV, or an EPSS score in the top
+// few percent, or a high CVSS score that is reachable from the network.
+// Deliberately a fixed rule so the same CVE always lands the same way.
+const ATTENTION_EPSS = 0.05;
+const ATTENTION_CVSS = 7;
+
 const $ = (sel) => document.querySelector(sel);
 
+const VIEWS = [
+  {
+    id: 'attention',
+    label: 'Needs attention',
+    sort: 'triage',
+    title: (c) => 'Unfixed in ' + c.label + ' and carrying a signal',
+    note: () =>
+      'Unfixed in this release and matching at least one of: listed in CISA KEV, ' +
+      'EPSS at or above ' + (ATTENTION_EPSS * 100) + '%, or CVSS ' + ATTENTION_CVSS +
+      '+ reachable over the network. Ordered by CISA KEV, then ransomware use, ' +
+      'then EPSS, then CVSS, then publication date.',
+    match: (r, i) => unfixed(r, i) && (
+      r.kev ||
+      (r.epss !== undefined && r.epss >= ATTENTION_EPSS) ||
+      (r.cvss >= ATTENTION_CVSS && (r.av === 'N' || r.av === 'A'))
+    ),
+  },
+  {
+    id: 'new',
+    label: 'New',
+    sort: 'new',
+    title: (c) => 'Published in the last ' + NEW_WINDOW + ' days',
+    note: (c) => 'Everything the kernel CNA published in the last ' + NEW_WINDOW +
+      ' days, with where ' + c.label + ' stands on each one.',
+    match: (r) => r.pub && r.pub >= Date.now() / 1000 - NEW_WINDOW * DAY,
+  },
+  {
+    id: 'waiting',
+    label: 'Waiting on Debian',
+    sort: 'oldest',
+    title: (c) => 'Fixed upstream, not yet in ' + c.label,
+    note: (c) => 'The stable series ' + c.label + ' tracks already has a release ' +
+      'containing the fix, but Debian still lists the CVE as unfixed here. ' +
+      'Longest waiting first.',
+    match: (r, i) => r.st[i] === 'V' && r.up && r.up[i] === 'P',
+  },
+  {
+    id: 'fixed',
+    label: 'Recently fixed',
+    sort: 'fixed',
+    title: (c) => 'Fixed in ' + c.label + ' in the last ' + FIXED_WINDOW + ' days',
+    note: () => 'CVEs where a Debian security advisory shipped the fix to this ' +
+      'release recently, newest first. The date is the advisory date.',
+    match: (r, i) => {
+      const when = r.fd && r.fd[i];
+      if (!when) return false;
+      return Date.parse(when + 'T00:00:00Z') / 1000 >= Date.now() / 1000 - FIXED_WINDOW * DAY;
+    },
+  },
+  {
+    id: 'all',
+    label: 'Search everything',
+    sort: 'new',
+    title: () => 'Every kernel CVE Debian tracks',
+    note: () => 'The full archive, back to the CVEs Debian carries from before ' +
+      'the kernel became its own CNA. Use the search box to narrow it.',
+    match: () => true,
+  },
+];
+
 const state = {
-  q: '', col: 0, status: 'any', sev: 'any', av: 'any', area: 'any',
-  since: 0, sort: 'new', kev: false, adv: false, pending: false, deep: false,
+  view: 'attention', col: 0,
+  q: '', status: 'any', sev: 'any', av: 'any', area: 'any',
+  since: 0, sort: '', kev: false, adv: false, deep: false,
 };
 
 let meta = null;
@@ -20,8 +93,8 @@ let rows = [];
 let filtered = [];
 let rendered = 0;
 let openCve = null;
-const detailCache = new Map();   // chunk id -> {cve: detail}
-const deepText = new Map();      // cve -> lowercased description
+const detailCache = new Map();
+const deepText = new Map();
 
 /* ---------------------------------------------------------------- utils */
 
@@ -29,26 +102,58 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
 ));
 
-const fmtDate = (ts) => ts
-  ? new Date(ts * 1000).toISOString().slice(0, 10)
-  : '—';
+const fmtDate = (ts) => (ts ? new Date(ts * 1000).toISOString().slice(0, 10) : '—');
 
-const DAY = 86400;
-
-function relative(ts) {
-  if (!ts) return '';
-  const days = Math.floor((Date.now() / 1000 - ts) / DAY);
-  if (days <= 0) return 'today';
-  if (days === 1) return 'yesterday';
-  if (days < 30) return days + ' days ago';
-  if (days < 365) return Math.floor(days / 30) + ' months ago';
-  return Math.floor(days / 365) + ' years ago';
+function ageDays(ts) {
+  if (!ts) return null;
+  return Math.floor((Date.now() / 1000 - ts) / DAY);
 }
 
-const STATUS_WORD = {
-  V: 'vulnerable', I: 'no-dsa', F: 'fixed',
-  N: 'not affected', U: 'undetermined', '-': 'n/a',
-};
+function ageLabel(ts) {
+  const d = ageDays(ts);
+  if (d === null) return '—';
+  if (d <= 0) return 'today';
+  if (d === 1) return '1 day';
+  if (d < 45) return d + ' days';
+  if (d < 730) return Math.round(d / 30.44) + ' months';
+  return Math.round(d / 365.25) + ' years';
+}
+
+function agoLabel(ts) {
+  const label = ageLabel(ts);
+  if (label === '—') return '';
+  return label === 'today' ? 'today' : label + ' ago';
+}
+
+const unfixed = (r, i) => r.st[i] === 'V' || r.st[i] === 'I';
+
+const view = () => VIEWS.find((v) => v.id === state.view) || VIEWS[0];
+const column = () => meta.columns[state.col];
+
+/* Which of the five lifecycle states a CVE is in for one release. */
+function lifecycle(r, i) {
+  const code = r.st[i];
+  if (code === '-') return { code: '-', word: 'n/a' };
+  if (code === 'F') {
+    const when = r.fd && r.fd[i];
+    return {
+      code: 'F',
+      word: 'fixed',
+      detail: when ? 'in an advisory on ' + when : (r.fix && r.fix[i] ? 'in ' + r.fix[i] : ''),
+      advisory: r.fa && r.fa[i],
+      when,
+    };
+  }
+  if (code === 'N') return { code: 'N', word: 'not affected' };
+  if (code === 'U') return { code: 'U', word: 'undetermined' };
+  if (code === 'I') {
+    return { code: 'I', word: "won't fix", detail: r.nodsa && r.nodsa[meta.columns[i].id] };
+  }
+  if (r.up && r.up[i] === 'P') {
+    return { code: 'P', word: 'fix ready upstream', detail: 'waiting on Debian' };
+  }
+  return { code: 'V', word: 'vulnerable', detail: 'no fix published yet' };
+}
 
 /* ------------------------------------------------------------- loading */
 
@@ -62,7 +167,9 @@ async function boot() {
   rows = idx.rows;
 
   $('#built-at').textContent = 'updated ' + meta.built.replace('T', ' ').replace('Z', ' UTC');
-  buildSuiteControls();
+  restoreSuite();
+  buildSuitePicker();
+  buildViewTabs();
   buildAreaOptions();
   $('#deep-size').textContent = '(~' + Math.round(meta.total * 1.4 / 1000) + ' MB)';
   wireControls();
@@ -70,89 +177,144 @@ async function boot() {
   apply();
 }
 
-function chunkUrl(n) { return 'data/details/' + n + '.json'; }
-
 async function loadChunk(n) {
   if (detailCache.has(n)) return detailCache.get(n);
-  const data = await fetch(chunkUrl(n)).then((r) => r.json());
+  const data = await fetch('data/details/' + n + '.json').then((r) => r.json());
   detailCache.set(n, data);
   return data;
 }
 
-/* --------------------------------------------------------- suite cards */
+/* --------------------------------------------------------- suite picker */
 
-function buildSuiteControls() {
-  const cards = $('#suite-cards');
-  const select = $('#col');
-  cards.innerHTML = '';
-  select.innerHTML = '';
+function restoreSuite() {
+  let saved = null;
+  try { saved = localStorage.getItem('suite'); } catch (e) { /* private mode */ }
+  const idx = meta.columns.findIndex((c) => c.id === saved);
+  if (idx >= 0) state.col = idx;
+  else state.col = Math.max(0, meta.columns.findIndex((c) => c.role === 'stable'));
+}
 
+function buildSuitePicker() {
+  const host = $('#suite-picker');
+  host.innerHTML = '';
   meta.columns.forEach((col, i) => {
     const tally = meta.counts[col.id];
-    const open = tally.V + tally.I;
-    const card = document.createElement('button');
-    card.type = 'button';
-    card.className = 'suite-card';
-    card.setAttribute('aria-pressed', String(i === state.col));
-    card.dataset.col = String(i);
-    card.innerHTML =
-      '<div class="sc-name">' + esc(col.release || col.suite) + '</div>' +
-      '<div class="sc-role">' + esc(col.label) +
-        (col.role ? ' · ' + esc(col.role) : '') + '</div>' +
-      '<div class="sc-ver">' + esc(col.version || 'unknown version') + '</div>' +
-      '<div class="sc-open' + (open ? '' : ' zero') + '">' + open.toLocaleString() +
-        ' <span>unfixed' + (tally.I ? ' (' + tally.I + ' no-dsa)' : '') + '</span></div>';
-    card.addEventListener('click', () => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'suite-btn';
+    btn.dataset.col = String(i);
+    btn.setAttribute('aria-pressed', String(i === state.col));
+    btn.innerHTML =
+      '<span class="sb-name">' + esc(col.release || col.suite) + '</span>' +
+      '<span class="sb-suite">' + esc(col.label) + '</span>' +
+      '<span class="sb-ver">' + esc(col.version || '') + '</span>' +
+      '<span class="sb-open">' + (tally.V + tally.I).toLocaleString() + ' unfixed</span>';
+    btn.addEventListener('click', () => {
       state.col = i;
+      try { localStorage.setItem('suite', col.id); } catch (e) { /* ignore */ }
       syncControls();
       apply();
     });
-    cards.appendChild(card);
-
-    const opt = document.createElement('option');
-    opt.value = String(i);
-    opt.textContent = col.label + (col.version ? ' — ' + col.version : '');
-    select.appendChild(opt);
+    host.appendChild(btn);
   });
-
-  renderTriageSummary();
 }
 
-function renderTriageSummary() {
-  const i = state.col;
-  const col = meta.columns[i];
-  let open = 0, kev = 0, pending = 0, network = 0, highSev = 0;
-  for (const r of rows) {
-    const code = r.st[i];
-    if (code !== 'V' && code !== 'I') continue;
-    open++;
-    if (r.kev) kev++;
-    if (r.up && r.up[i] === 'P') pending++;
-    if (r.av === 'N' || r.av === 'A') network++;
-    if (r.cvss >= 7) highSev++;
-  }
-  $('#triage-summary').innerHTML = [
-    ['unfixed in ' + esc(col.label), open, false],
-    ['in CISA KEV', kev, kev > 0],
-    ['CVSS 7.0 or higher', highSev, false],
-    ['network or adjacent reachable', network, false],
-    ['fix already released upstream', pending, false],
-  ].map(([label, n, alarm]) =>
-    '<div class="tstat' + (alarm ? ' alarm' : '') + '"><b>' +
-    n.toLocaleString() + '</b>' + label + '</div>'
-  ).join('');
+function buildViewTabs() {
+  const host = $('#views');
+  host.innerHTML = '';
+  VIEWS.forEach((v) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'view-tab';
+    btn.dataset.view = v.id;
+    btn.innerHTML = '<span class="vt-label">' + esc(v.label) + '</span>' +
+      '<span class="vt-count" data-count="' + v.id + '">–</span>';
+    btn.addEventListener('click', () => {
+      state.view = v.id;
+      state.sort = '';
+      if (v.id !== 'all') { state.q = ''; state.status = 'any'; state.since = 0; }
+      syncControls();
+      apply();
+    });
+    host.appendChild(btn);
+  });
 }
 
 function buildAreaOptions() {
   const areas = new Map();
   for (const r of rows) if (r.area) areas.set(r.area, (areas.get(r.area) || 0) + 1);
-  const sorted = [...areas.entries()].sort((a, b) => b[1] - a[1]);
   const select = $('#area');
-  for (const [name, n] of sorted) {
+  for (const [name, n] of [...areas.entries()].sort((a, b) => b[1] - a[1])) {
     const opt = document.createElement('option');
     opt.value = name;
     opt.textContent = name + '/ (' + n.toLocaleString() + ')';
     select.appendChild(opt);
+  }
+}
+
+/* ------------------------------------------------------------ exposure */
+
+function renderExposure() {
+  const i = state.col;
+  const col = column();
+  let open = 0, kev = 0, waiting = 0, stuck = 0, wontfix = 0, attention = 0;
+  for (const r of rows) {
+    if (!unfixed(r, i)) continue;
+    open++;
+    if (r.kev) kev++;
+    if (r.st[i] === 'I') wontfix++;
+    else if (r.up && r.up[i] === 'P') waiting++;
+    else stuck++;
+    if (VIEWS[0].match(r, i)) attention++;
+  }
+
+  const lag = meta.fix_lag ? meta.fix_lag[col.id] : null;
+  const lagText = lag && lag.n
+    ? 'Debian shipped an advisory a median of <b>' + lag.median + ' days</b> after ' +
+      'publication, and within <b>' + lag.p90 + ' days</b> 90% of the time ' +
+      '<span class="dim">(' + lag.n.toLocaleString() + ' advisories)</span>.'
+    : 'This release gets fixes through ordinary uploads rather than security ' +
+      'advisories, so there is no advisory turnaround to measure.';
+
+  const tile = (id, n, label, cls, status) =>
+    '<button type="button" class="tile ' + cls + '" data-goto="' + id + '"' +
+    (status ? ' data-status="' + status + '"' : '') + '>' +
+    '<b>' + n.toLocaleString() + '</b><span>' + label + '</span></button>';
+
+  $('#exposure-body').innerHTML =
+    '<p class="exposure-lead">' +
+      '<b>' + open.toLocaleString() + '</b> kernel CVEs are unfixed in ' +
+      '<strong>' + esc(col.release || col.suite) + '</strong> ' +
+      '<span class="dim">(' + esc(col.label) + ', running ' + esc(col.version || 'unknown') + ')</span>' +
+      (kev ? ' — <span class="alarm">' + kev + ' of them are in CISA KEV</span>.' : '.') +
+    '</p>' +
+    '<div class="tiles">' +
+      tile('attention', attention, 'need attention', 'warn') +
+      tile('waiting', waiting, 'fix ready upstream', 'pend') +
+      tile('all', stuck, 'no fix anywhere yet', 'plain', 'V') +
+      tile('all', wontfix, "Debian won't fix", 'plain', 'I') +
+    '</div>' +
+    '<p class="lag">' + lagText + '</p>';
+
+  $('#exposure-body').querySelectorAll('[data-goto]').forEach((el) => {
+    el.addEventListener('click', () => {
+      state.view = el.dataset.goto;
+      state.sort = '';
+      state.status = el.dataset.status || 'any';
+      syncControls();
+      apply();
+    });
+  });
+}
+
+function renderViewCounts() {
+  const i = state.col;
+  for (const v of VIEWS) {
+    const el = document.querySelector('[data-count="' + v.id + '"]');
+    if (!el) continue;
+    el.textContent = v.id === 'all'
+      ? rows.length.toLocaleString()
+      : rows.reduce((n, r) => n + (v.match(r, i) ? 1 : 0), 0).toLocaleString();
   }
 }
 
@@ -168,7 +330,6 @@ function wireControls() {
     });
   };
   bind('#q', 'q');
-  bind('#col', 'col', Number);
   bind('#status', 'status');
   bind('#sev', 'sev');
   bind('#av', 'av');
@@ -177,7 +338,6 @@ function wireControls() {
   bind('#sort', 'sort');
   bind('#kev', 'kev');
   bind('#adv', 'adv');
-  bind('#pending', 'pending');
 
   $('#deep').addEventListener('change', async (e) => {
     state.deep = e.target.checked;
@@ -188,7 +348,7 @@ function wireControls() {
   $('#reset').addEventListener('click', () => {
     Object.assign(state, {
       q: '', status: 'any', sev: 'any', av: 'any', area: 'any',
-      since: 0, sort: 'new', kev: false, adv: false, pending: false,
+      since: 0, sort: '', kev: false, adv: false,
     });
     syncControls();
     apply();
@@ -203,28 +363,27 @@ function wireControls() {
 
   window.addEventListener('hashchange', () => {
     const cve = location.hash.slice(1);
-    if (cve && cve !== openCve && /^CVE-/.test(cve)) focusCve(cve);
+    if (/^CVE-/.test(cve) && cve !== openCve) focusCve(cve);
   });
 }
 
 function syncControls() {
   $('#q').value = state.q;
-  $('#col').value = String(state.col);
   $('#status').value = state.status;
   $('#sev').value = state.sev;
   $('#av').value = state.av;
   $('#area').value = state.area;
   $('#since').value = String(state.since);
-  $('#sort').value = state.sort;
+  $('#sort').value = state.sort || view().sort;
   $('#kev').checked = state.kev;
   $('#adv').checked = state.adv;
-  $('#pending').checked = state.pending;
-  document.querySelectorAll('.suite-card').forEach((card) => {
-    card.setAttribute('aria-pressed', String(Number(card.dataset.col) === state.col));
+  document.querySelectorAll('.suite-btn').forEach((b) => {
+    b.setAttribute('aria-pressed', String(Number(b.dataset.col) === state.col));
+  });
+  document.querySelectorAll('.view-tab').forEach((b) => {
+    b.setAttribute('aria-pressed', String(b.dataset.view === state.view));
   });
 }
-
-/* ------------------------------------------------------------ deep search */
 
 async function loadAllDetails() {
   const bar = document.createElement('div');
@@ -245,16 +404,16 @@ async function loadAllDetails() {
 
 function apply() {
   const i = state.col;
-  const q = state.q.trim().toLowerCase();
-  const terms = q ? q.split(/\s+/) : [];
+  const v = view();
+  const terms = state.q.trim().toLowerCase().split(/\s+/).filter(Boolean);
   const cutoff = state.since ? Date.now() / 1000 - state.since * DAY : 0;
 
   filtered = rows.filter((r) => {
+    if (!v.match(r, i)) return false;
     const code = r.st[i];
     if (state.status !== 'any' && !state.status.includes(code)) return false;
     if (state.kev && !r.kev) return false;
     if (state.adv && !r.adv) return false;
-    if (state.pending && !(r.up && r.up[i] === 'P')) return false;
     if (state.av !== 'any' && r.av !== state.av) return false;
     if (state.area !== 'any' && r.area !== state.area) return false;
     if (cutoff && !(r.pub && r.pub >= cutoff)) return false;
@@ -269,17 +428,36 @@ function apply() {
 
   sortRows();
   writeHash();
-  renderTriageSummary();
-  syncFeedLink();
+  renderExposure();
+  renderViewCounts();
+  syncControls();
 
+  const col = column();
+  $('#view-title').textContent = v.title(col);
+  $('#view-note').textContent = v.note(col);
+  $('#when-head').textContent = state.view === 'fixed' ? 'Fixed' : 'Published';
+  $('#state-head').textContent = 'In ' + col.suite;
   $('#result-count').textContent =
-    filtered.length.toLocaleString() + ' of ' + rows.length.toLocaleString() + ' CVEs';
-  $('#sort-note').textContent = sortNote();
+    filtered.length.toLocaleString() + ' shown · ' + rows.length.toLocaleString() +
+    ' CVEs tracked in total';
   $('#empty').hidden = filtered.length > 0;
+  $('#empty').textContent = emptyMessage(v, col);
+
+  const link = $('#feed-link');
+  link.href = 'data/feeds/' + col.id + '.xml';
+  link.textContent = 'Atom feed for ' + col.label;
 
   $('#tbody').innerHTML = '';
   rendered = 0;
   renderMore();
+}
+
+function emptyMessage(v, col) {
+  if (v.id === 'attention') {
+    return 'Nothing unfixed in ' + col.label + ' carries a KEV listing, a high ' +
+      'EPSS score or a network-reachable high CVSS score. That is the good case.';
+  }
+  return 'Nothing matches here.';
 }
 
 function severityOf(r) {
@@ -291,95 +469,95 @@ function severityOf(r) {
 }
 
 function sortRows() {
+  const i = state.col;
+  const fixTime = (r) => {
+    const w = r.fd && r.fd[i];
+    return w ? Date.parse(w + 'T00:00:00Z') : 0;
+  };
   const cmp = {
-    // Newest first; undated CVEs (pre-2024, before the kernel was its own
-    // CNA) fall to the end, ordered by id.
     new: (a, b) => (b.pub || 0) - (a.pub || 0) || (a.id < b.id ? 1 : -1),
-    id: (a, b) => (a.id < b.id ? 1 : -1),
+    oldest: (a, b) => (a.pub || Infinity) - (b.pub || Infinity),
+    fixed: (a, b) => fixTime(b) - fixTime(a),
     epss: (a, b) => (b.epss || 0) - (a.epss || 0),
     cvss: (a, b) => (b.cvss ?? -1) - (a.cvss ?? -1),
-    // A fixed, documented rule - see sortNote().
     triage: (a, b) =>
       (b.kev || 0) - (a.kev || 0) ||
       (b.ransom || 0) - (a.ransom || 0) ||
       (b.epss || 0) - (a.epss || 0) ||
       (b.cvss ?? -1) - (a.cvss ?? -1) ||
       (b.pub || 0) - (a.pub || 0),
-  }[state.sort];
+  }[state.sort || view().sort];
   filtered.sort(cmp);
-}
-
-function sortNote() {
-  if (state.sort !== 'triage') return '';
-  return 'Triage order is a fixed rule, applied in this sequence: CISA KEV ' +
-    'membership, then known ransomware use, then EPSS score, then CVSS base ' +
-    'score, then publication date. Every input is a published value.';
 }
 
 /* -------------------------------------------------------------- render */
 
 function renderMore() {
-  if (rendered >= filtered.length) return;
-  const tbody = $('#tbody');
+  if (!filtered.length || rendered >= filtered.length) return;
   const frag = document.createDocumentFragment();
   const end = Math.min(rendered + BATCH, filtered.length);
   for (let n = rendered; n < end; n++) frag.appendChild(rowEl(filtered[n]));
-  tbody.appendChild(frag);
+  $('#tbody').appendChild(frag);
   rendered = end;
 }
 
-function triageBadges(r, col) {
+function triageBadges(r) {
   const out = [];
   if (r.kev) out.push('<span class="badge kev" title="Listed in CISA\'s Known Exploited Vulnerabilities catalogue">KEV</span>');
   if (r.ransom) out.push('<span class="badge ransom" title="KEV records known ransomware campaign use">ransomware</span>');
   if (r.cvss !== undefined) {
-    out.push('<span class="badge cvss ' + severityOf(r) + '" title="CVSS v3.1 base score from the kernel CNA vector">' +
-      r.cvss.toFixed(1) + '</span>');
+    out.push('<span class="badge cvss ' + severityOf(r) +
+      '" title="CVSS v3.1 base score from the kernel CNA vector">' + r.cvss.toFixed(1) + '</span>');
   }
   if (r.epss !== undefined) {
-    const pct = (r.epct * 100).toFixed(0);
     out.push('<span class="badge epss" title="EPSS ' + (r.epss * 100).toFixed(2) +
-      '% probability of exploitation in the next 30 days — higher than ' + pct +
-      '% of all scored CVEs">EPSS ' + (r.epss * 100).toFixed(1) + '%</span>');
+      '% probability of exploitation in the next 30 days — higher than ' +
+      (r.epct * 100).toFixed(0) + '% of all scored CVEs">EPSS ' + (r.epss * 100).toFixed(1) + '%</span>');
   }
   if (r.av) {
     out.push('<span class="badge av' + (r.av === 'N' || r.av === 'A' ? ' net' : '') +
       '" title="CVSS attack vector">AV:' + r.av + '</span>');
   }
-  if (r.adv) out.push('<span class="badge adv" title="Fixed by a Debian security advisory">' + esc(r.adv) + '</span>');
-  // Whether a fix is already sitting upstream depends on which suite you are
-  // looking at, so this badge follows the suite selector.
-  if (r.up && r.up[col] === 'P') {
-    out.push('<span class="badge pending" title="Debian lists this suite as vulnerable, but the stable series it tracks already has the fix">fix upstream</span>');
-  }
   return out.join(' ');
 }
 
-function suitePills(r) {
+function otherSuites(r) {
   return meta.columns.map((col, i) => {
-    const code = r.st[i];
-    if (code === '-') return '';
-    const fix = r.fix && r.fix[i];
-    const pendingCode = r.up ? r.up[i] : '.';
-    let tip = col.label + ': ' + STATUS_WORD[code];
-    if (fix) tip += ' in ' + fix;
-    if (pendingCode === 'P') tip += ' — fix already released upstream';
-    if (pendingCode === 'W') tip += ' — no upstream fix for this series yet';
-    return '<span class="pill ' + code + '" title="' + esc(tip) + '">' +
-      esc(col.suite) + (pendingCode === 'P' ? ' ↑' : '') + '</span>';
+    if (i === state.col || r.st[i] === '-') return '';
+    const s = lifecycle(r, i);
+    return '<span class="pill ' + s.code + '" title="' + esc(col.label + ': ' + s.word) + '">' +
+      esc(col.suite) + '</span>';
   }).join('');
 }
 
 function rowEl(r) {
+  const i = state.col;
+  const s = lifecycle(r, i);
   const tr = document.createElement('tr');
   tr.className = 'row';
   tr.dataset.cve = r.id;
+
+  const whenCell = state.view === 'fixed' && s.when
+    ? '<td class="when">' + esc(s.when) + '<span class="sub">' +
+      agoLabel(Date.parse(s.when + 'T00:00:00Z') / 1000) + '</span></td>'
+    : '<td class="when">' + fmtDate(r.pub) +
+      (r.pub ? '<span class="sub">' + agoLabel(r.pub) + '</span>' : '') + '</td>';
+
+  const stateCell = '<td class="state"><span class="state-chip s-' + s.code + '">' +
+    esc(s.word) + '</span>' +
+    (s.advisory ? '<span class="sub">' + esc(s.advisory) + '</span>'
+      : s.detail ? '<span class="sub">' + esc(s.detail) + '</span>' : '') +
+    ((s.code === 'V' || s.code === 'P') && r.pub
+      ? '<span class="sub dim">open ' + ageLabel(r.pub) + '</span>' : '') +
+    '</td>';
+
   tr.innerHTML =
     '<td class="cve">' + esc(r.id) + '</td>' +
-    '<td class="pub" title="' + esc(relative(r.pub)) + '">' + fmtDate(r.pub) + '</td>' +
-    '<td><div class="triage-cell">' + triageBadges(r, state.col) + '</div></td>' +
+    whenCell +
+    stateCell +
+    '<td><div class="triage-cell">' + triageBadges(r) + '</div></td>' +
     '<td class="sum">' + esc(r.sum) + '</td>' +
-    '<td><div class="pills">' + suitePills(r) + '</div></td>';
+    '<td class="pills-cell"><div class="pills">' + otherSuites(r) + '</div></td>';
   tr.addEventListener('click', () => toggleDetail(tr, r));
   return tr;
 }
@@ -400,13 +578,82 @@ async function toggleDetail(tr, r) {
   openCve = r.id;
   writeHash();
 
-  const row = document.createElement('tr');
-  row.className = 'detail';
-  row.innerHTML = '<td colspan="5"><div class="detail dim">Loading…</div></td>';
-  tr.after(row);
+  const holder = document.createElement('tr');
+  holder.className = 'detail';
+  holder.innerHTML = '<td colspan="6"><div class="detail dim">Loading…</div></td>';
+  tr.after(holder);
 
   const chunk = await loadChunk(r.c);
-  row.querySelector('td').innerHTML = detailHtml(r, chunk[r.id] || {});
+  holder.querySelector('td').innerHTML = detailHtml(r, chunk[r.id] || {});
+}
+
+/* The question the detail panel exists to answer: what happened to this CVE,
+ * in order, and where does my release sit in that sequence? */
+function timelineHtml(r, d) {
+  const i = state.col;
+  const col = column();
+  const s = lifecycle(r, i);
+  const steps = [];
+
+  steps.push({
+    done: true,
+    label: r.pub ? 'Published by the kernel CNA' : 'Published before the kernel became a CNA',
+    when: r.pub ? fmtDate(r.pub) : 'date unknown',
+    note: r.pub ? agoLabel(r.pub) : 'Debian has carried it since before 2024',
+  });
+
+  const series = seriesOf(col.version);
+  const upstreamFix = d.upstream && series ? d.upstream[series] : null;
+  if (upstreamFix) {
+    steps.push({
+      done: true,
+      label: 'Fixed upstream in the ' + series + ' series',
+      when: upstreamFix,
+      note: col.label + ' ships ' + (col.version || '?'),
+    });
+  } else if (s.code === 'V') {
+    steps.push({
+      done: false,
+      label: 'No upstream fix for the ' + (series || '?') + ' series yet',
+      when: '—',
+      note: 'nothing to backport so far',
+    });
+  }
+
+  if (s.code === 'F') {
+    steps.push({
+      done: true,
+      label: 'Fixed in ' + col.label,
+      when: s.when || (r.fix && r.fix[i]) || 'released',
+      note: s.advisory ? 'shipped in ' + s.advisory : 'shipped in ' + (r.fix[i] || 'an update'),
+    });
+  } else if (s.code === 'N') {
+    steps.push({ done: true, label: col.label + ' was never affected', when: '—', note: '' });
+  } else if (s.code === 'I') {
+    steps.push({
+      done: false,
+      label: 'Debian will not fix this in ' + col.label,
+      when: '—',
+      note: s.detail || '',
+    });
+  } else {
+    const lag = meta.fix_lag && meta.fix_lag[col.id];
+    steps.push({
+      done: false,
+      label: 'Not yet fixed in ' + col.label,
+      when: '—',
+      note: lag && lag.n
+        ? 'advisories for this release land a median of ' + lag.median + ' days after publication'
+        : 'this release is fixed by ordinary uploads, not advisories',
+    });
+  }
+
+  return '<ol class="timeline">' + steps.map((st) =>
+    '<li class="' + (st.done ? 'done' : 'pending') + '">' +
+    '<span class="tl-label">' + esc(st.label) + '</span>' +
+    '<span class="tl-when mono">' + esc(st.when) + '</span>' +
+    (st.note ? '<span class="tl-note dim">' + esc(st.note) + '</span>' : '') +
+    '</li>').join('') + '</ol>';
 }
 
 function detailHtml(r, d) {
@@ -419,86 +666,68 @@ function detailHtml(r, d) {
       'https://git.kernel.org/pub/scm/linux/security/vulns.git/tree/cve/published/' +
       year + '/' + r.id + '.json'],
   ];
-  if (d.debianbug) {
-    links.push(['Debian bug #' + d.debianbug, 'https://bugs.debian.org/' + d.debianbug]);
-  }
+  if (d.debianbug) links.push(['Debian bug #' + d.debianbug, 'https://bugs.debian.org/' + d.debianbug]);
 
   const statusRows = meta.columns.map((col, i) => {
-    const code = r.st[i];
-    if (code === '-') return '';
-    const fix = (r.fix && r.fix[i]) || '';
-    const pendingCode = r.up ? r.up[i] : '.';
-    let note = '';
-    if (pendingCode === 'P') {
-      const series = seriesOf(col.version);
-      const up = d.upstream && d.upstream[series];
-      note = '<span class="badge pending">fix in ' + esc(up || 'upstream') + '</span>';
-    } else if (pendingCode === 'W') {
-      note = '<span class="badge waiting">no upstream fix yet</span>';
-    }
-    if (code === 'I' && r.nodsa && r.nodsa[col.id]) {
-      note = '<span class="badge waiting">' + esc(r.nodsa[col.id]) + '</span>';
-    }
-    return '<tr><td><span class="pill ' + code + '">' + esc(col.suite) + '</span></td>' +
-      '<td>' + STATUS_WORD[code] + '</td>' +
-      '<td class="mono">' + esc(fix || col.version || '') + '</td>' +
-      '<td>' + note + '</td></tr>';
+    if (r.st[i] === '-') return '';
+    const s = lifecycle(r, i);
+    return '<tr><td><span class="pill ' + s.code + '">' + esc(col.suite) + '</span></td>' +
+      '<td>' + esc(s.word) + '</td>' +
+      '<td class="mono">' + esc((r.fix && r.fix[i]) || col.version || '') + '</td>' +
+      '<td class="mono dim">' + esc(s.when || '') + '</td>' +
+      '<td>' + (s.advisory
+        ? '<a href="https://security-tracker.debian.org/tracker/' + esc(s.advisory) + '">' +
+          esc(s.advisory) + '</a>'
+        : esc(s.detail || '')) + '</td></tr>';
   }).join('');
 
   const upstreamRows = (d.pairs || []).map(([intro, fixed, sha]) =>
     '<tr><td class="mono">' + esc(intro) + '</td><td class="mono">' + esc(fixed) + '</td>' +
     '<td><a class="mono" href="https://git.kernel.org/stable/c/' + esc(sha) + '">' +
-    esc(sha) + '</a></td></tr>'
-  ).join('');
+    esc(sha) + '</a></td></tr>').join('');
 
   const kevBox = d.kev ? (
-    '<div class="kevbox"><h3>Known exploited</h3>' +
-    '<dl class="kv">' +
+    '<div class="kevbox"><h3>Known to be exploited</h3><dl class="kv">' +
     '<dt>Added to KEV</dt><dd>' + esc(d.kev.added || '') + '</dd>' +
     '<dt>Federal due date</dt><dd>' + esc(d.kev.due || '') + '</dd>' +
     '<dt>Ransomware use</dt><dd>' + (d.kev.ransomware ? 'known' : 'unknown') + '</dd>' +
     (d.kev.action ? '<dt>Required action</dt><dd>' + esc(d.kev.action) + '</dd>' : '') +
-    '</dl></div>'
-  ) : '';
+    '</dl></div>') : '';
 
-  return '<div class="detail"><div class="detail-grid"><div>' +
-    '<h3>Description</h3>' +
-    '<p class="desc">' + esc(d.desc || 'No description published.') + '</p>' +
-    (d.files && d.files.length
-      ? '<h3>Files touched by the fix</h3><p class="files">' +
-        d.files.map(esc).join('<br>') + '</p>'
-      : '') +
-    '<div class="linkrow">' +
-      links.map(([t, u]) => '<a href="' + esc(u) + '">' + esc(t) + '</a>').join('') +
-    '</div>' +
-  '</div><div>' +
-    kevBox +
-    '<h3>Triage</h3><dl class="kv">' +
-      '<dt>CVSS</dt><dd>' + (r.cvss !== undefined
-        ? r.cvss.toFixed(1) + ' ' + severityOf(r) + '<br><span class="mono dim">' + esc(d.vector || '') + '</span>'
-        : '<span class="dim">no vector published</span>') + '</dd>' +
-      '<dt>EPSS</dt><dd>' + (r.epss !== undefined
-        ? (r.epss * 100).toFixed(2) + '% — higher than ' + (r.epct * 100).toFixed(1) + '% of all CVEs'
-        : '<span class="dim">not scored</span>') + '</dd>' +
-      '<dt>KEV</dt><dd>' + (r.kev ? 'listed' : '<span class="dim">not listed</span>') + '</dd>' +
-      '<dt>Debian urgency</dt><dd>' + esc(r.urg || 'not yet assigned') + '</dd>' +
-      '<dt>Scope</dt><dd>' + esc(d.scope || 'unknown') + '</dd>' +
-      '<dt>Subsystem</dt><dd class="mono">' + esc(d.subsystem || 'unknown') + '</dd>' +
-      (d.advisories && d.advisories.length
-        ? '<dt>Advisories</dt><dd>' + d.advisories.map((a) =>
-            '<a href="https://security-tracker.debian.org/tracker/' + esc(a.id) + '">' +
-            esc(a.id) + '</a> <span class="dim">' + esc(a.date) + '</span>').join('<br>') + '</dd>'
+  return '<div class="detail">' +
+    '<h3>What happened, and where ' + esc(column().label) + ' stands</h3>' +
+    timelineHtml(r, d) +
+    '<div class="detail-grid"><div>' +
+      '<h3>Description</h3>' +
+      '<p class="desc">' + esc(d.desc || 'No description published.') + '</p>' +
+      (d.files && d.files.length
+        ? '<h3>Files touched by the fix</h3><p class="files">' + d.files.map(esc).join('<br>') + '</p>'
         : '') +
-    '</dl>' +
-    '<h3>Debian status</h3>' +
-    '<table class="mini"><thead><tr><th>Suite</th><th>Status</th><th>Version</th><th></th></tr></thead>' +
-    '<tbody>' + statusRows + '</tbody></table>' +
-    (upstreamRows
-      ? '<h3>Upstream fixes</h3><table class="mini">' +
-        '<thead><tr><th>Introduced</th><th>Fixed in</th><th>Commit</th></tr></thead>' +
-        '<tbody>' + upstreamRows + '</tbody></table>'
-      : '') +
-  '</div></div></div>';
+      '<div class="linkrow">' +
+        links.map(([t, u]) => '<a href="' + esc(u) + '">' + esc(t) + '</a>').join('') +
+      '</div>' +
+    '</div><div>' +
+      kevBox +
+      '<h3>Triage</h3><dl class="kv">' +
+        '<dt>CVSS</dt><dd>' + (r.cvss !== undefined
+          ? r.cvss.toFixed(1) + ' ' + severityOf(r) +
+            '<br><span class="mono dim">' + esc(d.vector || '') + '</span>'
+          : '<span class="dim">no vector published</span>') + '</dd>' +
+        '<dt>EPSS</dt><dd>' + (r.epss !== undefined
+          ? (r.epss * 100).toFixed(2) + '% — higher than ' + (r.epct * 100).toFixed(1) + '% of all CVEs'
+          : '<span class="dim">not scored</span>') + '</dd>' +
+        '<dt>KEV</dt><dd>' + (r.kev ? 'listed' : '<span class="dim">not listed</span>') + '</dd>' +
+        '<dt>Debian urgency</dt><dd>' + esc(r.urg || 'not yet assigned') + '</dd>' +
+        '<dt>Subsystem</dt><dd class="mono">' + esc(d.subsystem || 'unknown') + '</dd>' +
+      '</dl>' +
+      '<h3>Every release</h3>' +
+      '<table class="mini"><thead><tr><th>Release</th><th>Status</th><th>Version</th>' +
+      '<th>Fixed</th><th>Advisory</th></tr></thead><tbody>' + statusRows + '</tbody></table>' +
+      (upstreamRows
+        ? '<h3>Upstream fixes</h3><table class="mini"><thead><tr><th>Introduced</th>' +
+          '<th>Fixed in</th><th>Commit</th></tr></thead><tbody>' + upstreamRows + '</tbody></table>'
+        : '') +
+    '</div></div></div>';
 }
 
 function seriesOf(version) {
@@ -507,8 +736,16 @@ function seriesOf(version) {
 }
 
 async function focusCve(cve) {
-  const idx = filtered.findIndex((r) => r.id === cve);
-  if (idx === -1) return;
+  let idx = filtered.findIndex((r) => r.id === cve);
+  if (idx === -1) {
+    // Fall back to the full archive so a shared link always resolves.
+    state.view = 'all';
+    state.q = cve;
+    syncControls();
+    apply();
+    idx = filtered.findIndex((r) => r.id === cve);
+    if (idx === -1) return;
+  }
   while (rendered <= idx) renderMore();
   const tr = document.querySelector('tr.row[data-cve="' + cve + '"]');
   if (tr) {
@@ -521,14 +758,18 @@ async function focusCve(cve) {
 
 function writeHash() {
   const parts = [];
-  const def = { q: '', col: 0, status: 'any', sev: 'any', av: 'any', area: 'any', since: 0, sort: 'new' };
+  const def = {
+    view: 'attention', q: '', status: 'any', sev: 'any',
+    av: 'any', area: 'any', since: 0, sort: '',
+  };
   for (const [k, v] of Object.entries(def)) {
     if (state[k] !== v) parts.push(k + '=' + encodeURIComponent(state[k]));
   }
-  for (const k of ['kev', 'adv', 'pending']) if (state[k]) parts.push(k + '=1');
+  if (meta && meta.columns[state.col]) parts.push('rel=' + meta.columns[state.col].id);
+  for (const k of ['kev', 'adv']) if (state[k]) parts.push(k + '=1');
   if (openCve) parts.push('cve=' + openCve);
-  const hash = parts.length ? '#' + parts.join('&') : '';
-  history.replaceState(null, '', location.pathname + location.search + hash);
+  history.replaceState(null, '', location.pathname + location.search +
+    (parts.length ? '#' + parts.join('&') : ''));
 }
 
 function readHash() {
@@ -539,19 +780,18 @@ function readHash() {
     const [k, v] = part.split('=');
     const value = decodeURIComponent(v ?? '');
     if (k === 'cve') { openCve = value; continue; }
+    if (k === 'rel') {
+      const idx = meta.columns.findIndex((c) => c.id === value);
+      if (idx >= 0) state.col = idx;
+      continue;
+    }
     if (!(k in state)) continue;
     if (typeof state[k] === 'boolean') state[k] = value === '1';
     else if (typeof state[k] === 'number') state[k] = Number(value);
     else state[k] = value;
   }
+  if (state.q || state.status !== 'any') $('#refine').open = true;
   syncControls();
-}
-
-function syncFeedLink() {
-  const col = meta.columns[state.col];
-  const link = $('#feed-link');
-  link.href = 'data/feeds/' + col.id + '.xml';
-  link.textContent = 'Atom feed: new CVEs open in ' + col.label;
 }
 
 /* --------------------------------------------------------------- theme */
@@ -559,9 +799,7 @@ function syncFeedLink() {
 function applyStoredTheme() {
   let stored = null;
   try { stored = localStorage.getItem('theme'); } catch (e) { /* private mode */ }
-  if (stored === 'light' || stored === 'dark') {
-    document.documentElement.dataset.theme = stored;
-  }
+  if (stored === 'light' || stored === 'dark') document.documentElement.dataset.theme = stored;
 }
 
 function toggleTheme() {
@@ -576,6 +814,6 @@ function toggleTheme() {
 boot().then(() => {
   if (openCve) focusCve(openCve);
 }).catch((err) => {
-  $('#result-count').textContent = 'Failed to load data';
+  $('#view-title').textContent = 'Failed to load data';
   console.error(err);
 });
