@@ -1,0 +1,7 @@
+# Downloaded source data and the vulns.git checkout.  Everything here is
+# rebuilt by scripts/build.py; none of it belongs in the repository.
+.cache/
+
+# Generated site data.  CI builds this fresh on every deploy, so committing
+# it would add tens of megabytes per run to the history for no benefit.
+site/data/

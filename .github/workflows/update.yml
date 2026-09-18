@@ -1,0 +1,69 @@
+name: Rebuild and deploy
+
+on:
+  schedule:
+    # Four times a day.  The kernel CNA publishes in bursts and the Debian
+    # tracker is regenerated continuously, so this keeps the site within a
+    # few hours of both.
+    - cron: '17 */6 * * *'
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Cache triage inputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/kev.json
+            .cache/epss.csv.gz
+            .cache/dsa-list.txt
+            .cache/dla-list.txt
+          key: triage-${{ github.run_id }}
+          restore-keys: triage-
+
+      - name: Build site data
+        run: python3 scripts/build.py --base-url "${{ steps.pages.outputs.base_url }}/"
+
+      - name: Report
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          meta = json.loads(pathlib.Path("site/data/meta.json").read_text())
+          print(f"::notice::{meta['total']} CVEs, {meta['kev_count']} in CISA KEV")
+          for col in meta["columns"]:
+              t = meta["counts"][col["id"]]
+              print(f"{col['label']:<26} {col['version']:<20} unfixed={t['V'] + t['I']}")
+          PY
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

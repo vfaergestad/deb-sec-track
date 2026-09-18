@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debian Linux Kernel CVE Tracker</title>
+<meta name="description" content="Every Linux kernel CVE, which Debian suites are still vulnerable, and the deterministic signals you need to triage it.">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<a class="skip" href="#results">Skip to results</a>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="titleblock">
+      <h1>Debian Linux Kernel CVE Tracker</h1>
+      <p class="tagline">
+        Every Linux kernel CVE, which Debian suites are still vulnerable,
+        and the published signals you need to triage it.
+      </p>
+    </div>
+    <div class="headmeta">
+      <span id="built-at" class="built">loading…</span>
+      <button type="button" id="theme-toggle" class="ghost" aria-label="Toggle colour theme">Theme</button>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section aria-labelledby="suites-h" class="panel">
+    <h2 id="suites-h" class="panel-h">Debian suites</h2>
+    <p class="panel-note">
+      Counts are CVEs the Debian Security Team currently lists as unfixed in
+      that suite. Select one to filter the table below.
+    </p>
+    <div id="suite-cards" class="suite-cards"></div>
+  </section>
+
+  <section aria-labelledby="triage-h" class="panel">
+    <h2 id="triage-h" class="panel-h">Triage signals</h2>
+    <p class="panel-note">
+      Every signal on this page is a lookup in a published dataset, keyed by
+      CVE id. Nothing is inferred, estimated by a model, or hand-scored.
+    </p>
+    <div id="triage-summary" class="triage-summary"></div>
+    <details class="explain">
+      <summary>How each signal is derived</summary>
+      <dl class="explain-dl">
+        <dt><span class="badge kev">KEV</span></dt>
+        <dd>The CVE appears in <a href="https://www.cisa.gov/known-exploited-vulnerabilities-catalog">CISA's Known Exploited Vulnerabilities</a> catalogue, meaning CISA has evidence of exploitation in the wild. Straight membership test on <code>cveID</code>.</dd>
+        <dt><span class="badge ransom">ransomware</span></dt>
+        <dd>The same KEV record has <code>knownRansomwareCampaignUse: "Known"</code>.</dd>
+        <dt><span class="badge epss">EPSS</span></dt>
+        <dd><a href="https://www.first.org/epss/">FIRST's EPSS</a> score: the modelled probability that the CVE is exploited in the next 30 days, published daily as a CSV. Shown with its percentile among all scored CVEs.</dd>
+        <dt><span class="badge cvss">CVSS</span></dt>
+        <dd>CVSS v3.1 base score, computed with the standard formula from the vector the Linux kernel CNA published for that CVE. Only some CVEs carry a vector; the rest show as unrated rather than being given a made-up number.</dd>
+        <dt><span class="badge av">AV:N</span></dt>
+        <dd>Attack vector from the same CVSS vector — <code>N</code>etwork, <code>A</code>djacent, <code>L</code>ocal or <code>P</code>hysical. For kernel bugs this splits the list more usefully than the score alone.</dd>
+        <dt><span class="badge adv">DSA/DLA</span></dt>
+        <dd>A Debian Security Advisory (stable) or LTS advisory shipped a fix for this CVE, taken from the security team's own advisory lists.</dd>
+        <dt><span class="badge pending">fix upstream</span></dt>
+        <dd>Debian lists the suite as vulnerable, and version arithmetic on the kernel CNA's fixed-version list shows a fix already released in the stable series that suite tracks. In other words the fix exists and has not been pulled in yet.</dd>
+        <dt><span class="badge waiting">no fix yet</span></dt>
+        <dd>Debian lists the suite as vulnerable and upstream has published no fix for that stable series either.</dd>
+      </dl>
+    </details>
+  </section>
+
+  <section aria-labelledby="filters-h" class="panel">
+    <h2 id="filters-h" class="panel-h">Filters</h2>
+    <div class="controls">
+      <div class="field grow">
+        <label for="q">Search</label>
+        <input type="search" id="q" placeholder="CVE id, summary text, subsystem…" autocomplete="off" spellcheck="false">
+        <label class="check deep"><input type="checkbox" id="deep"> <span>include descriptions <span class="dim" id="deep-size"></span></span></label>
+      </div>
+      <div class="field">
+        <label for="col">Suite</label>
+        <select id="col"></select>
+      </div>
+      <div class="field">
+        <label for="status">Status in suite</label>
+        <select id="status">
+          <option value="any">any</option>
+          <option value="VI">vulnerable or no-dsa</option>
+          <option value="V">vulnerable</option>
+          <option value="I">no-dsa</option>
+          <option value="F">fixed</option>
+          <option value="N">not affected</option>
+          <option value="U">undetermined</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="sev">Severity</label>
+        <select id="sev">
+          <option value="any">any</option>
+          <option value="critical">critical (9.0+)</option>
+          <option value="high">high (7.0–8.9)</option>
+          <option value="medium">medium (4.0–6.9)</option>
+          <option value="low">low (&lt;4.0)</option>
+          <option value="unrated">unrated</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="av">Attack vector</label>
+        <select id="av">
+          <option value="any">any</option>
+          <option value="N">network</option>
+          <option value="A">adjacent</option>
+          <option value="L">local</option>
+          <option value="P">physical</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="area">Subsystem</label>
+        <select id="area"><option value="any">any</option></select>
+      </div>
+      <div class="field">
+        <label for="since">Published</label>
+        <select id="since">
+          <option value="0">any time</option>
+          <option value="7">last 7 days</option>
+          <option value="30">last 30 days</option>
+          <option value="90">last 90 days</option>
+          <option value="365">last year</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="sort">Sort</label>
+        <select id="sort">
+          <option value="new">newest first</option>
+          <option value="triage">triage order</option>
+          <option value="epss">EPSS score</option>
+          <option value="cvss">CVSS score</option>
+          <option value="id">CVE id</option>
+        </select>
+      </div>
+      <div class="field checks">
+        <label class="check"><input type="checkbox" id="kev"> <span>in CISA KEV</span></label>
+        <label class="check"><input type="checkbox" id="adv"> <span>has DSA/DLA</span></label>
+        <label class="check"><input type="checkbox" id="pending"> <span>fix waiting upstream</span></label>
+        <button type="button" id="reset" class="ghost">Reset</button>
+      </div>
+    </div>
+    <p class="sort-note" id="sort-note"></p>
+  </section>
+
+  <section id="results" aria-labelledby="results-h" class="panel">
+    <h2 id="results-h" class="panel-h">
+      <span id="result-count">Loading…</span>
+      <a id="feed-link" class="feedlink" href="#" title="Atom feed of new CVEs open in this suite">Atom feed</a>
+    </h2>
+    <div class="tablewrap">
+      <table id="table">
+        <thead>
+          <tr>
+            <th scope="col" class="c-cve">CVE</th>
+            <th scope="col" class="c-pub">Published</th>
+            <th scope="col" class="c-triage">Triage</th>
+            <th scope="col" class="c-sum">Summary</th>
+            <th scope="col" class="c-suites">Debian suites</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <div id="sentinel" class="sentinel" aria-hidden="true"></div>
+    <p id="empty" class="empty" hidden>Nothing matches these filters.</p>
+  </section>
+
+  <footer class="page-foot">
+    <p>
+      Data from the
+      <a href="https://security-tracker.debian.org/tracker/source-package/linux">Debian Security Tracker</a>,
+      the <a href="https://git.kernel.org/pub/scm/linux/security/vulns.git">Linux kernel CNA</a>,
+      <a href="https://www.cisa.gov/known-exploited-vulnerabilities-catalog">CISA KEV</a> and
+      <a href="https://www.first.org/epss/">FIRST EPSS</a>.
+      This site is not affiliated with the Debian project.
+    </p>
+    <p class="dim">
+      Debian's own status is authoritative for whether a suite is fixed. The
+      upstream comparison is a convenience, computed from published version
+      numbers.
+    </p>
+  </footer>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
