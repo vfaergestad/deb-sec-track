@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Debian Kernel CVE Tracker</title>
-<meta name="description" content="A Linux kernel CVE landed. See whether your Debian release is exposed, how urgent it is, and when the fix arrives.">
+<meta name="description" content="Heard about a Linux kernel vulnerability? Look up whether Debian is affected, which releases, and what to do about it.">
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -15,8 +15,8 @@
     <div class="titleblock">
       <h1>Debian Kernel CVE Tracker</h1>
       <p class="tagline">
-        A Linux kernel CVE landed. See whether the release you run is exposed,
-        how urgent it is, and when the fix arrives.
+        Heard about a Linux kernel vulnerability? Look up whether Debian is
+        affected, which releases, and what to do about it.
       </p>
     </div>
     <div class="headmeta">
@@ -28,14 +28,40 @@
 
 <main class="wrap">
 
-  <section aria-labelledby="picker-h" class="panel">
-    <h2 id="picker-h" class="panel-h">Which release do you run?</h2>
-    <div id="suite-picker" class="suite-picker"></div>
+  <section class="panel hero" aria-labelledby="hero-h">
+    <h2 id="hero-h" class="hero-h">Look up a kernel CVE</h2>
+    <div class="hero-search">
+      <input type="search" id="q" autocomplete="off" spellcheck="false"
+             placeholder="CVE-2026-93204 — or a subsystem, like ksmbd, nftables, io_uring">
+      <button type="button" id="clear-q" class="ghost" hidden>Clear</button>
+    </div>
+    <p class="hero-hint" id="hero-hint">
+      Paste a CVE id to jump straight to it, or search by subsystem to see
+      what has been found there.
+    </p>
   </section>
 
-  <section id="exposure" aria-labelledby="exposure-h" class="panel exposure">
-    <h2 id="exposure-h" class="panel-h">Your exposure</h2>
-    <div id="exposure-body"></div>
+  <section class="panel" aria-labelledby="overview-h">
+    <h2 id="overview-h" class="panel-h">Debian right now</h2>
+    <p class="panel-note">
+      Where each Debian release stands across every Linux kernel CVE the
+      security team tracks.
+    </p>
+    <div class="tablewrap">
+      <table class="overview" id="overview">
+        <thead>
+          <tr>
+            <th scope="col">Release</th>
+            <th scope="col">Kernel</th>
+            <th scope="col" class="num">Unfixed</th>
+            <th scope="col" class="num">Fix ready upstream</th>
+            <th scope="col" class="num">Unfixed &amp; exploited</th>
+            <th scope="col">Typical time to an advisory</th>
+          </tr>
+        </thead>
+        <tbody id="overview-body"></tbody>
+      </table>
+    </div>
   </section>
 
   <nav class="views" id="views" aria-label="Views"></nav>
@@ -43,20 +69,18 @@
   <section id="results" aria-labelledby="results-h" class="panel">
     <h2 id="results-h" class="panel-h">
       <span id="view-title">Loading…</span>
-      <a id="feed-link" class="feedlink" href="#">Atom feed</a>
     </h2>
     <p class="view-note" id="view-note"></p>
 
     <details class="refine" id="refine">
-      <summary>Refine and search</summary>
+      <summary>More filters</summary>
       <div class="controls">
-        <div class="field grow">
-          <label for="q">Search</label>
-          <input type="search" id="q" placeholder="CVE id, summary text, subsystem…" autocomplete="off" spellcheck="false">
-          <label class="check deep"><input type="checkbox" id="deep"> <span>include descriptions <span class="dim" id="deep-size"></span></span></label>
+        <div class="field">
+          <label for="rel">Release</label>
+          <select id="rel"><option value="any">any release</option></select>
         </div>
         <div class="field">
-          <label for="status">Status in release</label>
+          <label for="status">Status there</label>
           <select id="status">
             <option value="any">any</option>
             <option value="VI">unfixed</option>
@@ -64,7 +88,6 @@
             <option value="I">won't fix (no-dsa)</option>
             <option value="F">fixed</option>
             <option value="N">not affected</option>
-            <option value="U">undetermined</option>
           </select>
         </div>
         <div class="field">
@@ -93,30 +116,19 @@
           <select id="area"><option value="any">any</option></select>
         </div>
         <div class="field">
-          <label for="since">Published</label>
-          <select id="since">
-            <option value="0">any time</option>
-            <option value="7">last 7 days</option>
-            <option value="30">last 30 days</option>
-            <option value="90">last 90 days</option>
-            <option value="365">last year</option>
-          </select>
-        </div>
-        <div class="field">
           <label for="sort">Sort</label>
           <select id="sort">
             <option value="new">newest first</option>
-            <option value="triage">triage order</option>
-            <option value="oldest">longest waiting</option>
+            <option value="triage">most serious first</option>
+            <option value="oldest">longest unfixed</option>
             <option value="fixed">most recently fixed</option>
             <option value="epss">EPSS score</option>
             <option value="cvss">CVSS score</option>
           </select>
         </div>
         <div class="field checks">
-          <label class="check"><input type="checkbox" id="kev"> <span>in CISA KEV</span></label>
-          <label class="check"><input type="checkbox" id="adv"> <span>has DSA/DLA</span></label>
-          <button type="button" id="reset" class="ghost">Clear</button>
+          <label class="check"><input type="checkbox" id="deep"> <span>search descriptions <span class="dim" id="deep-size"></span></span></label>
+          <button type="button" id="reset" class="ghost">Clear filters</button>
         </div>
       </div>
     </details>
@@ -127,10 +139,9 @@
           <tr>
             <th scope="col" class="c-cve">CVE</th>
             <th scope="col" class="c-when" id="when-head">Published</th>
-            <th scope="col" class="c-state" id="state-head">Status</th>
-            <th scope="col" class="c-triage">Triage</th>
-            <th scope="col" class="c-sum">Summary</th>
-            <th scope="col" class="c-suites">Other releases</th>
+            <th scope="col" class="c-sum">What it is</th>
+            <th scope="col" class="c-triage">Signals</th>
+            <th scope="col" class="c-suites">Debian releases</th>
           </tr>
         </thead>
         <tbody id="tbody"></tbody>
@@ -141,35 +152,44 @@
     <p class="count-note" id="result-count"></p>
   </section>
 
-  <section aria-labelledby="signals-h" class="panel">
-    <h2 id="signals-h" class="panel-h">Where every signal comes from</h2>
+  <section aria-labelledby="legend-h" class="panel">
+    <h2 id="legend-h" class="panel-h">How to read this</h2>
     <p class="panel-note">
-      Each one is a lookup in a published dataset, keyed by CVE id, or
+      Every signal is a lookup in a published dataset keyed by CVE id, or
       arithmetic over published values. Nothing is inferred or model-scored,
       so the same inputs always give the same answer.
     </p>
     <dl class="explain-dl">
+      <dt><span class="state-chip s-V">vulnerable</span></dt>
+      <dd>The Debian Security Team lists this release as unfixed, and upstream has published no fix for the stable series it tracks either. There is nothing to install yet.</dd>
+      <dt><span class="state-chip s-P">fix ready upstream</span></dt>
+      <dd>Debian still lists it unfixed, but the stable series this release tracks already has a version containing the fix, so it should arrive in a future kernel update.</dd>
+      <dt><span class="state-chip s-F">fixed</span></dt>
+      <dd>A fixed package version is available. Where a DSA or DLA shipped it, the advisory and date are shown.</dd>
+      <dt><span class="state-chip s-I">won't fix</span></dt>
+      <dd>Debian triaged it and decided against an update for this release, with their stated reason.</dd>
+      <dt><span class="state-chip s-N">not affected</span></dt>
+      <dd>This release never shipped the vulnerable code.</dd>
       <dt><span class="badge kev">KEV</span></dt>
-      <dd>Listed in <a href="https://www.cisa.gov/known-exploited-vulnerabilities-catalog">CISA's Known Exploited Vulnerabilities</a> catalogue — CISA has evidence of exploitation in the wild.</dd>
+      <dd>Listed in <a href="https://www.cisa.gov/known-exploited-vulnerabilities-catalog">CISA's Known Exploited Vulnerabilities</a> catalogue — there is evidence of exploitation in the wild. The strongest signal on this page.</dd>
       <dt><span class="badge ransom">ransomware</span></dt>
       <dd>That KEV record carries <code>knownRansomwareCampaignUse: "Known"</code>.</dd>
       <dt><span class="badge epss">EPSS</span></dt>
       <dd><a href="https://www.first.org/epss/">FIRST's EPSS</a>: modelled probability of exploitation in the next 30 days, republished daily.</dd>
       <dt><span class="badge cvss high">CVSS</span></dt>
-      <dd>CVSS v3.1 base score, computed with the standard formula from the vector the Linux kernel CNA published. CVEs without a vector show as unrated rather than getting an invented number.</dd>
+      <dd>CVSS v3.1 base score, computed with the standard formula from the vector the Linux kernel CNA published. CVEs without a vector are shown as unrated rather than given an invented number.</dd>
       <dt><span class="badge av net">AV:N</span></dt>
-      <dd>Attack vector from that same vector. For kernel bugs, network-reachable versus local-only splits the list more usefully than the score does.</dd>
-      <dt><span class="state-chip s-V">vulnerable</span></dt>
-      <dd>The Debian Security Team lists your release as unfixed, and upstream has published no fix for the stable series it tracks either.</dd>
-      <dt><span class="state-chip s-P">fix ready upstream</span></dt>
-      <dd>Debian still lists it as unfixed, but the stable series your release tracks already has a release containing the fix. Comparing version numbers tells you the fix exists and is waiting to be pulled in.</dd>
-      <dt><span class="state-chip s-F">fixed</span></dt>
-      <dd>A fixed package version is available. Where a DSA or DLA shipped it, the advisory and its date are shown, which is the firm answer to "when was this fixed".</dd>
-      <dt><span class="state-chip s-I">won't fix</span></dt>
-      <dd>Debian has triaged it and decided against an update for this release, with their stated reason.</dd>
-      <dt><span class="state-chip s-N">not affected</span></dt>
-      <dd>This release never shipped the vulnerable code.</dd>
+      <dd>Attack vector. For kernel bugs, network-reachable versus local-only usually matters more than the score.</dd>
     </dl>
+  </section>
+
+  <section aria-labelledby="feeds-h" class="panel">
+    <h2 id="feeds-h" class="panel-h">Follow along</h2>
+    <p class="panel-note">
+      Atom feeds of newly published CVEs that are still unfixed in a given
+      release.
+    </p>
+    <div class="feedlist" id="feedlist"></div>
   </section>
 
   <footer class="page-foot">
@@ -178,7 +198,8 @@
       <a href="https://security-tracker.debian.org/tracker/source-package/linux">Debian Security Tracker</a>,
       the <a href="https://git.kernel.org/pub/scm/linux/security/vulns.git">Linux kernel CNA</a>,
       <a href="https://www.cisa.gov/known-exploited-vulnerabilities-catalog">CISA KEV</a> and
-      <a href="https://www.first.org/epss/">FIRST EPSS</a>. Not affiliated with the Debian project.
+      <a href="https://www.first.org/epss/">FIRST EPSS</a>. Not affiliated with
+      the Debian project.
     </p>
     <p class="dim">
       Debian's own status is authoritative for whether a release is fixed. The

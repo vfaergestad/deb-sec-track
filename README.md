@@ -1,56 +1,61 @@
 # Debian Kernel CVE Tracker
 
-A kernel CVE landed. Is the Debian release I run exposed, how urgent is it,
-and when does the fix arrive?
+Heard about a Linux kernel vulnerability? Look up whether Debian is affected,
+which releases, and what to do about it.
 
-That is the whole point of this site. It is not a CVE archive you browse —
-it opens on what needs your attention in the release you actually run, and
-every CVE carries its position in the fix pipeline.
+That is the whole site. It is a public reference, not a dashboard: it knows
+nothing about you or your machines, asks you to configure nothing, and shows
+every Debian release side by side on every CVE.
 
-Every signal is a lookup in a published dataset keyed by CVE id, or
-arithmetic over published values. Nothing is inferred, estimated by a model,
-or scored by hand.
+Every signal is a lookup in a published dataset keyed by CVE id, or arithmetic
+over published values. Nothing is inferred, estimated by a model, or scored by
+hand.
 
-## The workflow
+## How you use it
 
-Pick the release you run (remembered between visits), then work through five
-views:
+Paste a CVE id into the box at the top. The site jumps straight to it and
+answers, for each Debian release:
+
+- what status the Debian Security Team gives it,
+- which package version fixes it, and which DSA or DLA shipped that fix on
+  what date,
+- and what that means in practice — from "update the kernel and reboot" to
+  "no fix exists anywhere yet".
+
+If you do not have a CVE id, search by subsystem (`ksmbd`, `nftables`,
+`io_uring`) or work through the views:
 
 | View | Answers |
 | --- | --- |
-| **Needs attention** | Of everything unfixed in my release, what carries a real signal? |
-| **New** | What did the kernel CNA publish in the last 30 days, and where does my release stand on each? |
-| **Waiting on Debian** | Upstream already fixed it — what hasn't been pulled in yet, and how long has it been waiting? |
-| **Recently fixed** | What got fixed in my release lately, by which advisory, on what date? |
-| **Search everything** | The full archive, when you need to look something up. |
-
-"Needs attention" is a fixed rule: unfixed in the selected release, **and**
-at least one of — listed in CISA KEV, EPSS at or above 5%, or CVSS 7.0+ with
-a network or adjacent attack vector. Its ordering is equally fixed: KEV, then
-known ransomware use, then EPSS, then CVSS, then publication date.
+| **Latest** | What has the kernel CNA published in the last 30 days? |
+| **Exploited in the wild** | Which kernel CVEs are in CISA's KEV catalogue, and is Debian still exposed to any of them? |
+| **Unfixed in Debian** | What is still open in at least one release, most serious first? |
+| **Recently fixed** | What did Debian's advisories fix lately? |
+| **Everything** | The full archive. |
 
 ## Fix lifecycle
 
-Each CVE sits in one of these states for each release, and the site leads
-with that rather than with a raw status column:
+Each CVE sits in one of these states per release:
 
 - **vulnerable** — Debian lists it unfixed, and upstream has published no fix
-  for the stable series this release tracks either. Nothing to pull in yet.
+  for the stable series that release tracks either. There is nothing to
+  install yet.
 - **fix ready upstream** — Debian still lists it unfixed, but the stable
-  series this release tracks already has a release containing the fix. This
-  is the difference between *nobody has fixed this* and *the fix exists and
-  is waiting*, and it is computed by comparing the version Debian ships
-  against the CNA's fixed-version list.
-- **fixed** — a fixed version is available, with the DSA or DLA that shipped
-  it and the date, where there was one.
-- **won't fix** — Debian triaged it and decided against an update here, with
-  their stated reason.
-- **not affected** — this release never shipped the vulnerable code.
+  series that release tracks already has a version containing the fix, so it
+  should arrive in a future kernel update. This is the difference between
+  *nobody has fixed this* and *the fix exists and is waiting*, and it is
+  computed by comparing the version Debian ships against the CNA's
+  fixed-version list.
+- **fixed** — a fixed version is available, with the advisory and date where
+  one shipped it.
+- **won't fix** — Debian triaged it and decided against an update for that
+  release, with their stated reason.
+- **not affected** — that release never shipped the vulnerable code.
 
-### When does the fix arrive?
+### How long Debian takes
 
 Debian's advisory lists record which advisory shipped to which suite on which
-date, so the answer is measured rather than guessed. At the time of writing:
+date, so the turnaround is measured, not guessed:
 
 | Release | Median | 90% within | Sample |
 | --- | --- | --- | --- |
@@ -60,7 +65,8 @@ date, so the answer is measured rather than guessed. At the time of writing:
 
 Measured from CVE publication to the advisory that fixed it. `forky` and
 `sid` get fixes through ordinary uploads rather than advisories, so there is
-no advisory turnaround to measure for them.
+no advisory turnaround to measure. These are historical distributions, not a
+promise about any particular CVE.
 
 ## Signals
 
@@ -110,7 +116,7 @@ artifact, which keeps tens of megabytes per run out of the git history.
 
 ## Feeds
 
-Each release gets an Atom feed of newly published CVEs still open in it, at
+Each release has an Atom feed of newly published CVEs still unfixed in it, at
 `data/feeds/<release>.xml`.
 
 ## Data files
@@ -133,10 +139,12 @@ Each release gets an Atom feed of newly published CVEs still open in it, at
 - Debian's own status is authoritative. The upstream comparison is a
   convenience built from version numbers, and a targeted backport can fix a
   CVE without changing the version Debian ships.
+- A fixed package is not the same as a fixed machine: a running kernel keeps
+  the old code until the system reboots.
 - Fix-lag figures cover CVEs fixed through an advisory. Many are fixed by a
   routine stable rebase instead, which carries no per-CVE date.
 - EPSS models exploitation likelihood across the whole CVE corpus. It is
-  reproducible, but it says nothing about your configuration.
+  reproducible, but it says nothing about any particular deployment.
 - CVEs predating the kernel becoming its own CNA (early 2024) often have no
   publication date and a thinner record.
 
