@@ -15,6 +15,14 @@ kernel.org vulns.git
     first added the CVE's record), because the published JSON itself carries
     no timestamp.
 
+CISA Vulnrichment
+    CISA's ADP container for CVE records: the three SSVC decision points
+    (Exploitation, Automatable, Technical Impact), plus a CVSS vector and a
+    CWE where the CNA supplied neither.  Coverage of kernel CVEs is partial
+    (32%) and thins out sharply for recent ones, and on this corpus the
+    "active" exploitation value selects exactly the KEV set and nothing more
+    - so read docs/vulnrichment.md before building anything on it.
+
 Outputs, all under site/data/
 -----------------------------
 meta.json            Suite definitions, kernel versions, counts, build time.
@@ -39,6 +47,8 @@ from pathlib import Path
 
 DEBIAN_JSON_URL = "https://security-tracker.debian.org/tracker/data/json"
 VULNS_REPO = "https://git.kernel.org/pub/scm/linux/security/vulns.git"
+VULNRICHMENT_REPO = "https://github.com/cisagov/vulnrichment.git"
+VULNRICHMENT_BRANCH = "develop"
 
 # Triage inputs.  Every one of these is a published dataset looked up by CVE
 # id; nothing here is inferred, scored by hand, or guessed at.
@@ -145,6 +155,55 @@ def sync_vulns(cache: Path, offline: bool) -> Path:
             ["git", "clone", "--quiet", "--single-branch", VULNS_REPO, str(repo)],
             check=True,
         )
+    return repo
+
+
+def sync_vulnrichment(cache: Path, offline: bool) -> Path | None:
+    """Keep a bare, shallow mirror of CISA's Vulnrichment repo in the cache.
+
+    The repo is ~187k small JSON files.  A normal clone checks all of them out
+    for 1.5 GB of working tree we would immediately throw away, and a blobless
+    partial clone makes every record a separate round trip.  A *bare* shallow
+    clone is the cheap middle: one packfile, no checkout, and the ~6k records
+    we actually want come straight out of it with `git cat-file`.
+
+    Enrichment is optional, so every failure here degrades to "no Vulnrichment
+    data" rather than failing the build.
+    """
+    repo = cache / "vulnrichment"
+    if offline:
+        if not repo.exists():
+            log("warning: --offline and no vulnrichment mirror cached - skipping")
+            return None
+        log("using cached vulnrichment mirror")
+        return repo
+    try:
+        if repo.exists():
+            log("updating vulnrichment mirror")
+            # Fetch straight onto the local branch HEAD points at, so that
+            # HEAD is the tip afterwards - a bare repo has no checkout to
+            # move for us.
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "fetch", "--quiet", "--depth", "1",
+                    "--force", "origin",
+                    f"{VULNRICHMENT_BRANCH}:refs/heads/{VULNRICHMENT_BRANCH}",
+                ],
+                check=True,
+            )
+        else:
+            log(f"cloning {VULNRICHMENT_REPO} (~170 MB, once)")
+            subprocess.run(
+                [
+                    "git", "clone", "--quiet", "--bare", "--depth", "1",
+                    "--single-branch", "--branch", VULNRICHMENT_BRANCH,
+                    VULNRICHMENT_REPO, str(repo),
+                ],
+                check=True,
+            )
+    except (subprocess.CalledProcessError, OSError) as exc:
+        log(f"warning: vulnrichment mirror unavailable ({exc}) - continuing without it")
+        return repo if repo.exists() else None
     return repo
 
 
@@ -531,6 +590,152 @@ def load_advisories(cache: Path, offline: bool) -> dict[str, list[dict]]:
     return out
 
 
+# CISA's own ADP container is identified by this org id.  A record can carry
+# several ADP containers (the CVE Program's own, a supplier's); matching on
+# the id rather than on position or title is the only reliable way to pick
+# CISA's out.
+CISA_ADP_ORG = "134c704f-9b21-4f2e-91b3-4a467353bcc0"
+
+# SSVC decision-point values, compacted to one character each for index.json
+# and published in meta.json so the codes are self-describing.
+SSVC_CODES = {
+    "order": ["exploitation", "automatable", "technical_impact"],
+    "exploitation": {
+        "n": "none - no public exploit code or observed exploitation",
+        "p": "poc - a public proof of concept exists",
+        "a": "active - exploitation observed in the wild",
+    },
+    "automatable": {
+        "y": "yes - reconnaissance through exploitation can be automated",
+        "n": "no - an attacker cannot reliably automate all four steps",
+    },
+    "technical_impact": {
+        "p": "partial - limited control of the affected component",
+        "t": "total - total control of the affected component",
+    },
+}
+
+
+def vulnrichment_path(cve: str) -> str | None:
+    """'CVE-2024-57951' -> '2024/57xxx/CVE-2024-57951.json'."""
+    parts = cve.split("-", 2)
+    if len(parts) != 3 or not parts[2].isdigit():
+        return None
+    _, year, num = parts
+    return f"{year}/{num[:-3] or '0'}xxx/{cve}.json"
+
+
+def load_vulnrichment(repo: Path | None, cves: list[str]) -> dict[str, dict]:
+    """CISA Vulnrichment ADP data for the CVEs we track, keyed by CVE id.
+
+    Only the records we need are read: asking `git cat-file --batch` for a
+    path that is not in the tree costs a "missing" line and nothing else, so
+    one pass over our own CVE list is enough - no directory listing, no
+    per-file process, no network.
+
+    Everything taken here is a value CISA published against that CVE id.  The
+    SSVC decision points are CISA's analysts' recorded answers, not something
+    this build derives.
+    """
+    if repo is None:
+        return {}
+
+    wanted = [(cve, vulnrichment_path(cve)) for cve in cves]
+    wanted = [(cve, path) for cve, path in wanted if path]
+    query = "".join(f"HEAD:{path}\n" for _cve, path in wanted)
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "--batch"],
+            input=query.encode(),
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+    except (subprocess.CalledProcessError, OSError) as exc:
+        log(f"warning: could not read vulnrichment mirror ({exc}) - skipping")
+        return {}
+
+    data = proc.stdout
+    out: dict[str, dict] = {}
+    pos = 0
+    for cve, _path in wanted:
+        end = data.find(b"\n", pos)
+        if end < 0:
+            break
+        header = data[pos:end].decode("utf-8", "replace")
+        pos = end + 1
+        if header.endswith(" missing"):
+            continue
+        try:
+            size = int(header.rsplit(" ", 1)[1])
+        except (IndexError, ValueError):
+            break
+        body = data[pos:pos + size]
+        pos += size + 1  # git writes a newline after each object
+        record = parse_vulnrichment(body)
+        if record:
+            out[cve] = record
+
+    log(f"CISA Vulnrichment: {len(out)} of {len(cves)} tracked CVEs enriched")
+    return out
+
+
+def parse_vulnrichment(body: bytes) -> dict | None:
+    """Pull CISA's ADP container out of one CVE record."""
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return None
+    adp = None
+    for container in doc.get("containers", {}).get("adp", []):
+        if container.get("providerMetadata", {}).get("orgId") == CISA_ADP_ORG:
+            adp = container
+            break
+    if adp is None:
+        return None
+
+    record: dict = {}
+    for metric in adp.get("metrics", []):
+        other = metric.get("other") or {}
+        if other.get("type") == "ssvc":
+            content = other.get("content", {})
+            for option in content.get("options", []):
+                for key, value in option.items():
+                    # "Technical Impact" -> "technical_impact"
+                    record[key.lower().replace(" ", "_")] = value
+            record["scored"] = (content.get("timestamp") or "")[:10]
+        # CISA only adds a CVSS when the CNA published none.  A record can
+        # carry more than one version of it, so take the newest and keep it.
+        for key in ("cvssV4_0", "cvssV3_1", "cvssV3_0"):
+            if key in metric and "cvss_vector" not in record:
+                record["cvss_vector"] = metric[key].get("vectorString")
+                record["cvss_score"] = metric[key].get("baseScore")
+                break
+
+    cwes = []
+    for problem in adp.get("problemTypes", []):
+        for desc in problem.get("descriptions", []):
+            if desc.get("cweId"):
+                cwes.append({"id": desc["cweId"], "name": desc.get("description", "")})
+    if cwes:
+        record["cwe"] = cwes
+
+    record["updated"] = (adp.get("providerMetadata", {}).get("dateUpdated") or "")[:10]
+    return record or None
+
+
+def ssvc_code(record: dict) -> str:
+    """The three SSVC decision points as one three-character string.
+
+    A '?' means CISA published a container for this CVE but not that decision
+    point - absent, not assumed.
+    """
+    return (
+        (record.get("exploitation") or "?")[0]
+        + (record.get("automatable") or "?")[0]
+        + (record.get("technical_impact") or "?")[0]
+    )
+
+
 # --------------------------------------------------------------------------
 # version arithmetic
 # --------------------------------------------------------------------------
@@ -648,6 +853,7 @@ def assemble(
     kev: dict[str, dict],
     epss: dict[str, tuple[float, float]],
     advisories: dict[str, list[dict]],
+    vulnrichment: dict[str, dict],
 ):
     all_cves = sorted({cve for pkg in packages.values() for cve in pkg})
     rows = []
@@ -691,6 +897,7 @@ def assemble(
         kev_entry = kev.get(cve)
         epss_entry = epss.get(cve)
         advs = advisories.get(cve, [])
+        vr = vulnrichment.get(cve)
 
         # The advisory that actually shipped the fix to each suite, which is
         # the only firm "this was fixed on <date>" the archive gives us.
@@ -733,6 +940,20 @@ def assemble(
         if epss_entry:
             row["epss"] = round(epss_entry[0], 5)
             row["epct"] = round(epss_entry[1], 5)
+        if vr:
+            # Three characters carry all three decision points, which keeps
+            # the cost of this on the critical path down to ~80 KB overall.
+            row["ssvc"] = ssvc_code(vr)
+            if vr.get("cwe"):
+                row["cwe"] = vr["cwe"][0]["id"]
+            # CISA fills CVSS in only where the CNA published none, so these
+            # stay in their own fields rather than being merged into `cvss`:
+            # two authorities scoring the same CVE disagree often enough that
+            # silently blending them would misrepresent both.
+            vr_score = vr.get("cvss_score")
+            if vr_score is not None and "cvss" not in row:
+                row["vcvss"] = vr_score
+                row["vsev"] = severity_of(vr_score)
         if advs:
             row["adv"] = advs[0]["id"]
         if any(fix_dates):
@@ -760,6 +981,7 @@ def assemble(
             "kev": kev_entry,
             "advisories": advs,
             "pending": pending,
+            "vulnrichment": vr,
         }
 
     # Newest first.  CVEs with no publication date (mostly pre-2024, before the
@@ -894,6 +1116,7 @@ def main() -> None:
         DEBIAN_JSON_URL, args.cache / "debian-tracker.json", args.offline
     )
     repo = sync_vulns(args.cache, args.offline)
+    vr_repo = sync_vulnrichment(args.cache, args.offline)
 
     packages = extract_packages(debian_path, PACKAGES)
     if "linux" not in packages:
@@ -903,6 +1126,9 @@ def main() -> None:
     kev, kev_version = load_kev(args.cache, args.offline)
     epss, epss_date = load_epss(args.cache, args.offline)
     advisories = load_advisories(args.cache, args.offline)
+    # Vulnrichment is read per CVE id, so it needs the tracked set first.
+    tracked = sorted({cve for pkg in packages.values() for cve in pkg})
+    vulnrichment = load_vulnrichment(vr_repo, tracked)
 
     # Columns and their shipped kernel versions have to exist before the rows
     # do: the "fix pending upstream" check compares against those versions.
@@ -912,7 +1138,7 @@ def main() -> None:
         col["version"] = versions.get(col["id"], "")
 
     rows, details = assemble(
-        packages, kernel, dates, columns, kev, epss, advisories
+        packages, kernel, dates, columns, kev, epss, advisories, vulnrichment
     )
 
     built = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -939,6 +1165,14 @@ def main() -> None:
         "epss_scored": epss_date,
         "kev_count": sum(1 for r in rows if r.get("kev")),
         "advisory_count": sum(1 for r in rows if r.get("adv")),
+        "ssvc_codes": SSVC_CODES,
+        "vulnrichment_count": sum(1 for r in rows if r.get("ssvc")),
+        "vulnrichment_exploitation": {
+            name: sum(1 for r in rows if r.get("ssvc", "")[:1] == code)
+            for code, name in (("n", "none"), ("p", "poc"), ("a", "active"))
+        },
+        "vulnrichment_cwe_count": sum(1 for r in rows if r.get("cwe")),
+        "vulnrichment_cvss_count": sum(1 for r in rows if r.get("vcvss")),
         "chunk_size": DETAIL_CHUNK,
         "chunks": len(chunks),
         "total": len(rows),
@@ -950,6 +1184,7 @@ def main() -> None:
             "kev": KEV_URL,
             "epss": EPSS_URL,
             "advisories": ADVISORY_URLS["DSA"],
+            "vulnrichment": "https://github.com/cisagov/vulnrichment",
         },
         "packages": list(packages),
     }
@@ -966,6 +1201,15 @@ def main() -> None:
     log(
         f"  triage: {meta['kev_count']} in CISA KEV, "
         f"{meta['advisory_count']} covered by a DSA/DLA"
+    )
+    exploitation = meta["vulnrichment_exploitation"]
+    log(
+        f"  vulnrichment: {meta['vulnrichment_count']}/{len(rows)} CVEs enriched "
+        f"({100 * meta['vulnrichment_count'] / len(rows):.1f}%), "
+        f"exploitation none={exploitation['none']} poc={exploitation['poc']} "
+        f"active={exploitation['active']}, "
+        f"{meta['vulnrichment_cwe_count']} with a CWE, "
+        f"{meta['vulnrichment_cvss_count']} given a CVSS the CNA never published"
     )
     for col in columns:
         tally = meta["counts"][col["id"]]
