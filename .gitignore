@@ -5,3 +5,10 @@
 # Generated site data.  CI builds this fresh on every deploy, so committing
 # it would add tens of megabytes per run to the history for no benefit.
 site/data/
+
+# Generated static CVE pages, sitemap and robots.txt.  scripts/render_pages.py
+# rebuilds these from site/data/ on every deploy; committing ~47 MB of HTML per
+# run would bloat the history for no benefit.
+site/cve/
+site/sitemap.xml
+site/robots.txt

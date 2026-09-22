@@ -43,6 +43,9 @@ jobs:
       - name: Build site data
         run: python3 scripts/build.py --base-url "${{ steps.pages.outputs.base_url }}/"
 
+      - name: Render static CVE pages
+        run: python3 scripts/render_pages.py --base-url "${{ steps.pages.outputs.base_url }}/"
+
       - name: Report
         run: |
           python3 - <<'PY'

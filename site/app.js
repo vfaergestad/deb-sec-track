@@ -584,6 +584,9 @@ function detailHtml(r, d) {
       year + '/' + r.id + '.json'],
   ];
   if (d.debianbug) links.push(['Debian bug #' + d.debianbug, 'https://bugs.debian.org/' + d.debianbug]);
+  // A shareable address that renders without JavaScript, for people who land
+  // here from a search engine or paste the link into a ticket.
+  links.unshift(['Permalink for this CVE', 'cve/' + r.id + '.html']);
 
   // The answer table: one row per release, ending in what to do about it.
   const actionRows = meta.columns.map((col, i) => {
