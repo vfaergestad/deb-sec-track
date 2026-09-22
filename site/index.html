@@ -159,28 +159,38 @@
       arithmetic over published values. Nothing is inferred or model-scored,
       so the same inputs always give the same answer.
     </p>
-    <dl class="explain-dl">
-      <dt><span class="state-chip s-V">vulnerable</span></dt>
-      <dd>The Debian Security Team lists this release as unfixed, and upstream has published no fix for the stable series it tracks either. There is nothing to install yet.</dd>
-      <dt><span class="state-chip s-P">fix ready upstream</span></dt>
-      <dd>Debian still lists it unfixed, but the stable series this release tracks already has a version containing the fix, so it should arrive in a future kernel update.</dd>
-      <dt><span class="state-chip s-F">fixed</span></dt>
-      <dd>A fixed package version is available. Where a DSA or DLA shipped it, the advisory and date are shown.</dd>
-      <dt><span class="state-chip s-I">won't fix</span></dt>
-      <dd>Debian triaged it and decided against an update for this release, with their stated reason.</dd>
-      <dt><span class="state-chip s-N">not affected</span></dt>
-      <dd>This release never shipped the vulnerable code.</dd>
-      <dt><span class="badge kev">KEV</span></dt>
-      <dd>Listed in <a href="https://www.cisa.gov/known-exploited-vulnerabilities-catalog">CISA's Known Exploited Vulnerabilities</a> catalogue — there is evidence of exploitation in the wild. The strongest signal on this page.</dd>
-      <dt><span class="badge ransom">ransomware</span></dt>
-      <dd>That KEV record carries <code>knownRansomwareCampaignUse: "Known"</code>.</dd>
-      <dt><span class="badge epss">EPSS</span></dt>
-      <dd><a href="https://www.first.org/epss/">FIRST's EPSS</a>: modelled probability of exploitation in the next 30 days, republished daily.</dd>
-      <dt><span class="badge cvss high">CVSS</span></dt>
-      <dd>CVSS v3.1 base score, computed with the standard formula from the vector the Linux kernel CNA published. CVEs without a vector are shown as unrated rather than given an invented number.</dd>
-      <dt><span class="badge av net">AV:N</span></dt>
-      <dd>Attack vector. For kernel bugs, network-reachable versus local-only usually matters more than the score.</dd>
-    </dl>
+    <div class="explain-groups">
+      <div class="explain-group">
+        <h3 class="explain-h">Per-release lifecycle states</h3>
+        <dl class="explain-dl">
+          <dt><span class="state-chip s-V">vulnerable</span></dt>
+          <dd>The Debian Security Team lists this release as unfixed, and upstream has published no fix for the stable series it tracks either. There is nothing to install yet.</dd>
+          <dt><span class="state-chip s-P">fix ready upstream</span></dt>
+          <dd>Debian still lists it unfixed, but the stable series this release tracks already has a version containing the fix, so it should arrive in a future kernel update.</dd>
+          <dt><span class="state-chip s-F">fixed</span></dt>
+          <dd>A fixed package version is available. Where a DSA or DLA shipped it, the advisory and date are shown.</dd>
+          <dt><span class="state-chip s-I">won't fix</span></dt>
+          <dd>Debian triaged it and decided against an update for this release, with their stated reason.</dd>
+          <dt><span class="state-chip s-N">not affected</span></dt>
+          <dd>This release never shipped the vulnerable code.</dd>
+        </dl>
+      </div>
+      <div class="explain-group">
+        <h3 class="explain-h">Triage signals</h3>
+        <dl class="explain-dl">
+          <dt><span class="badge kev">KEV</span></dt>
+          <dd>Listed in <a href="https://www.cisa.gov/known-exploited-vulnerabilities-catalog">CISA's Known Exploited Vulnerabilities</a> catalogue — there is evidence of exploitation in the wild. The strongest signal on this page.</dd>
+          <dt><span class="badge ransom">ransomware</span></dt>
+          <dd>That KEV record carries <code>knownRansomwareCampaignUse: "Known"</code>.</dd>
+          <dt><span class="badge epss">EPSS</span></dt>
+          <dd><a href="https://www.first.org/epss/">FIRST's EPSS</a>: modelled probability of exploitation in the next 30 days, republished daily.</dd>
+          <dt><span class="badge cvss high">CVSS</span></dt>
+          <dd>CVSS v3.1 base score, computed with the standard formula from the vector the Linux kernel CNA published. CVEs without a vector are shown as unrated rather than given an invented number.</dd>
+          <dt><span class="badge av net">AV:N</span></dt>
+          <dd>Attack vector. For kernel bugs, network-reachable versus local-only usually matters more than the score.</dd>
+        </dl>
+      </div>
+    </div>
   </section>
 
   <section aria-labelledby="feeds-h" class="panel">

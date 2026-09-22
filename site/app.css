@@ -362,6 +362,48 @@ td.when {
 .tl-when { font-size: 12.5px; white-space: nowrap; }
 .tl-note { grid-column: 1 / -1; font-size: 12.5px; }
 
+/* ---------- legend ---------- */
+
+.explain-groups {
+  display: grid;
+  gap: 16px;
+}
+.explain-group + .explain-group {
+  border-top: 1px solid var(--line-soft);
+  padding-top: 16px;
+}
+.explain-h {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-dim);
+}
+.explain-dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: minmax(9.5rem, max-content) minmax(0, 1fr);
+  gap: 9px 16px;
+  align-items: baseline;
+  font-size: 13px;
+}
+.explain-dl dt { margin: 0; }
+.explain-dl dd {
+  margin: 0;
+  color: var(--ink-dim);
+  max-width: 80ch;
+}
+
+@media (max-width: 560px) {
+  .explain-dl {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+  .explain-dl dd { margin-bottom: 12px; }
+  .explain-dl dd:last-child { margin-bottom: 0; }
+}
+
 /* ---------- controls ---------- */
 
 .controls {
