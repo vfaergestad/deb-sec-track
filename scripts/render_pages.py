@@ -9,7 +9,7 @@ the answer has to exist as a plain page at a plain URL.  That is what this
 writes: site/cve/<CVE-ID>.html, one self-contained page that renders with
 JavaScript switched off, plus a sitemap and robots.txt so crawlers find them.
 
-Every fact on a page is read out of site/data/ — the same files the app reads —
+Every fact on a page is read out of site/data/, the same files the app reads,
 and the lifecycle/advice wording below is a direct port of lifecycle() and
 advice() in site/app.js, so a static page and the app say the same thing about
 the same CVE.  Nothing here infers, estimates or scores anything.
@@ -19,7 +19,7 @@ Run from the repository root, after scripts/build.py has written site/data/:
     python3 scripts/render_pages.py [--base-url https://example.github.io/repo/]
 
 Output is idempotent: two runs over the same site/data/ produce byte-identical
-files.  Everything that would otherwise vary — "3 months ago", <lastmod> — is
+files.  Everything that would otherwise vary ("3 months ago", <lastmod>) is
 derived from meta.built rather than from the clock.
 """
 
@@ -71,7 +71,7 @@ def esc(value):
 
 def fmt_date(ts):
     if not ts:
-        return "—"
+        return "unknown"
     return time.strftime("%Y-%m-%d", time.gmtime(ts))
 
 
@@ -79,7 +79,7 @@ def age_label(ts, now):
     """Port of ageLabel() in app.js, measured from the build time so that the
     same data always renders the same bytes."""
     if not ts:
-        return "—"
+        return "unknown"
     d = int((now - ts) // DAY)
     if d <= 0:
         return "today"
@@ -94,7 +94,7 @@ def age_label(ts, now):
 
 def ago_label(ts, now):
     label = age_label(ts, now)
-    if label == "—":
+    if label == "unknown":
         return ""
     return label if label == "today" else label + " ago"
 
@@ -107,7 +107,7 @@ def series_of(version):
 
 
 def severity_of(row):
-    """Port of severityOf() in app.js.  No published vector means unrated —
+    """Port of severityOf() in app.js.  No published vector means unrated,
     never a guessed number."""
     cvss = row.get("cvss")
     if cvss is None:
@@ -172,8 +172,8 @@ def advice(row, i, detail, meta):
             what = "%s shipped the fix on %s, in %s." % (
                 s["advisory"], s["when"], s["version"] or "an update")
         else:
-            what = "fixed in %s." % (s["version"] or "a later version")
-        return ("Update the kernel and reboot — " + what +
+            what = "Fixed in %s." % (s["version"] or "a later version")
+        return ("Update the kernel and reboot. " + what +
                 " A running kernel keeps the old code until the machine restarts.")
     if code == "P":
         series = series_of(col.get("version"))
@@ -183,7 +183,7 @@ def advice(row, i, detail, meta):
                 % (upstream if upstream else "the %s series" % (series or "?"),
                    col["suite"], lag_note))
     if code == "V":
-        return ("No fix published anywhere yet — not in Debian and not upstream for "
+        return ("No fix published anywhere yet, neither in Debian nor upstream for "
                 "the series %s tracks. Watch the Debian tracker page for this CVE.%s"
                 % (col["suite"], lag_note))
     if code == "I":
@@ -191,7 +191,7 @@ def advice(row, i, detail, meta):
                 "release is the way to get the fix."
                 % (col["suite"], (": " + s["reason"] + ".") if s["reason"] else "."))
     if code == "N":
-        return "Nothing to do — %s never shipped the vulnerable code." % col["suite"]
+        return "Nothing to do. %s never shipped the vulnerable code." % col["suite"]
     if code == "U":
         return "Debian has not finished triaging this one for %s." % col["suite"]
     return "This package is not part of %s." % col["suite"]
@@ -212,7 +212,7 @@ def triage_badges(row):
                    'kernel CNA vector">%.1f</span>' % (severity_of(row), row["cvss"]))
     if row.get("epss") is not None:
         out.append('<span class="badge epss" title="EPSS %.2f%% probability of '
-                   'exploitation in the next 30 days — higher than %.0f%% of all '
+                   'exploitation in the next 30 days, higher than %.0f%% of all '
                    'scored CVEs">EPSS %.1f%%</span>'
                    % (row["epss"] * 100, row["epct"] * 100, row["epss"] * 100))
     if row.get("av"):
@@ -303,7 +303,7 @@ def meta_description(row, meta):
         tail.append("CVSS %.1f" % row["cvss"])
     else:
         tail.append("no CVSS vector published")
-    text = "%s: %s. Debian status — %s. %s." % (
+    text = "%s: %s. Debian status: %s. %s." % (
         row["id"], row["sum"], "; ".join(parts), "; ".join(tail))
     if len(text) > 320:
         text = text[:317].rstrip() + "…"
@@ -348,12 +348,12 @@ def render_page(row, detail, meta, base_url, now):
     summary = row["sum"]
     title_sum = summary if len(summary) <= 80 else summary[:79].rstrip() + "…"
 
-    cvss_dd = ('<span class="dim">no vector published — unrated</span>'
+    cvss_dd = ('<span class="dim">no vector published, unrated</span>'
                if row.get("cvss") is None else
                '%.1f %s<br /><span class="mono dim">%s</span>'
                % (row["cvss"], severity_of(row), esc(detail.get("vector") or "")))
     epss_dd = ('<span class="dim">not scored</span>' if row.get("epss") is None else
-               "%.2f%% — higher than %.1f%% of all CVEs"
+               "%.2f%%, higher than %.1f%% of all CVEs"
                % (row["epss"] * 100, row["epct"] * 100))
     kev_dd = ("listed" + (", known ransomware use" if row.get("ransom") else "")
               if row.get("kev") else '<span class="dim">not listed</span>')
@@ -363,7 +363,7 @@ def render_page(row, detail, meta, base_url, now):
     files_block = ""
     if detail.get("files"):
         files_block = ("<h3>Where it lives</h3>"
-                       '<p class="panel-note">The fix touches these files — if the '
+                       '<p class="panel-note">The fix touches these files. If the '
                        "subsystem is one you do not use, the practical exposure is "
                        "lower, though the package is still the vulnerable one.</p>"
                        '<p class="files">%s</p>'
@@ -392,7 +392,7 @@ def render_page(row, detail, meta, base_url, now):
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{cve}: {title_sum} — Debian kernel CVE tracker</title>
+<title>{cve}: {title_sum} | Debian kernel CVE tracker</title>
 <meta name="description" content="{description}" />
 <link rel="canonical" href="{canonical}" />
 <link rel="stylesheet" href="../app.css" />
@@ -553,7 +553,7 @@ def main(argv=None):
     site = Path(args.site)
     data = site / "data"
     if not (data / "meta.json").exists():
-        sys.exit("%s not found — run scripts/build.py first" % (data / "meta.json"))
+        sys.exit("%s not found, run scripts/build.py first" % (data / "meta.json"))
 
     base_url = args.base_url
     if base_url.startswith("http://"):
@@ -617,7 +617,7 @@ def main(argv=None):
     print("     total generated bytes: %d (%s of the %s budget)"
           % (total + sm + rb, human(total + sm + rb), human(MAX_TOTAL_BYTES)))
     if total + sm + rb > MAX_TOTAL_BYTES:
-        sys.exit("generated HTML exceeds the %s budget — tighten the inclusion "
+        sys.exit("generated HTML exceeds the %s budget, tighten the inclusion "
                  "rule at the top of this file" % human(MAX_TOTAL_BYTES))
     return 0
 

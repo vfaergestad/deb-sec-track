@@ -44,7 +44,7 @@ const VIEWS = [
     sort: 'triage',
     title: 'Unfixed in at least one Debian release',
     note: 'Ordered by CISA KEV listing, then known ransomware use, then EPSS, ' +
-      'then CVSS, then publication date — a fixed rule over published values.',
+      'then CVSS, then publication date. This is a fixed rule over published values.',
     match: (r) => anyUnfixed(r),
   },
   {
@@ -89,10 +89,10 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
 ));
 
-const fmtDate = (ts) => (ts ? new Date(ts * 1000).toISOString().slice(0, 10) : '—');
+const fmtDate = (ts) => (ts ? new Date(ts * 1000).toISOString().slice(0, 10) : 'unknown');
 
 function ageLabel(ts) {
-  if (!ts) return '—';
+  if (!ts) return 'unknown';
   const d = Math.floor((Date.now() / 1000 - ts) / DAY);
   if (d <= 0) return 'today';
   if (d === 1) return '1 day';
@@ -103,7 +103,7 @@ function ageLabel(ts) {
 
 function agoLabel(ts) {
   const label = ageLabel(ts);
-  if (label === '—') return '';
+  if (label === 'unknown') return '';
   return label === 'today' ? 'today' : label + ' ago';
 }
 
@@ -146,10 +146,10 @@ function advice(r, i, d) {
 
   switch (s.code) {
     case 'F':
-      return 'Update the kernel and reboot — ' +
+      return 'Update the kernel and reboot. ' +
         (s.advisory
           ? s.advisory + ' shipped the fix on ' + s.when + ', in ' + (s.version || 'an update') + '.'
-          : 'fixed in ' + (s.version || 'a later version') + '.') +
+          : 'Fixed in ' + (s.version || 'a later version') + '.') +
         ' A running kernel keeps the old code until the machine restarts.';
     case 'P': {
       const series = seriesOf(col.version);
@@ -160,7 +160,7 @@ function advice(r, i, d) {
         'future kernel update.' + lagNote;
     }
     case 'V':
-      return 'No fix published anywhere yet — not in Debian and not upstream ' +
+      return 'No fix published anywhere yet, neither in Debian nor upstream ' +
         'for the series ' + col.suite + ' tracks. Watch the Debian tracker page ' +
         'for this CVE.' + lagNote;
     case 'I':
@@ -168,7 +168,7 @@ function advice(r, i, d) {
         (s.reason ? ': ' + s.reason + '.' : '.') +
         ' Moving to a newer release is the way to get the fix.';
     case 'N':
-      return 'Nothing to do — ' + col.suite + ' never shipped the vulnerable code.';
+      return 'Nothing to do. ' + col.suite + ' never shipped the vulnerable code.';
     case 'U':
       return 'Debian has not finished triaging this one for ' + col.suite + '.';
     default:
@@ -226,7 +226,7 @@ function renderOverview() {
       '<td><strong>' + esc(col.release || col.suite) + '</strong>' +
         '<span class="sub">' + esc(col.label) +
         (col.role ? ' · ' + esc(col.role) : '') + '</span></td>' +
-      '<td class="mono">' + esc(col.version || '—') + '</td>' +
+      '<td class="mono">' + esc(col.version || 'unknown') + '</td>' +
       '<td class="num' + (open ? '' : ' good') + '">' + open.toLocaleString() + '</td>' +
       '<td class="num">' + ready.toLocaleString() + '</td>' +
       '<td class="num' + (kev ? ' bad' : ' good') + '">' + kev.toLocaleString() + '</td>' +
@@ -441,7 +441,7 @@ function heroHint() {
   }
   if (CVE_RE.test(typed)) {
     return filtered.length
-      ? 'Found it — the answer for every Debian release is below.'
+      ? 'Found it. The answer for every Debian release is below.'
       : typed.toUpperCase() + ' is not a Linux kernel CVE that Debian tracks. It ' +
         'may affect a different package, or not apply to Debian at all.';
   }
@@ -452,7 +452,7 @@ function emptyMessage() {
   const typed = state.q.trim();
   if (CVE_RE.test(typed)) {
     return typed.toUpperCase() + ' is not in the Linux kernel CVE data Debian ' +
-      'tracks. Check the Debian Security Tracker directly — it may belong to ' +
+      'tracks. Check the Debian Security Tracker directly, since it may belong to ' +
       'another package.';
   }
   if (typed) return 'No kernel CVE matches that. Try a subsystem name, like ksmbd or nftables.';
@@ -510,7 +510,7 @@ function triageBadges(r) {
   }
   if (r.epss !== undefined) {
     out.push('<span class="badge epss" title="EPSS ' + (r.epss * 100).toFixed(2) +
-      '% probability of exploitation in the next 30 days — higher than ' +
+      '% probability of exploitation in the next 30 days, higher than ' +
       (r.epct * 100).toFixed(0) + '% of all scored CVEs">EPSS ' +
       (r.epss * 100).toFixed(1) + '%</span>');
   }
@@ -525,7 +525,7 @@ function releasePills(r) {
   return meta.columns.map((col, i) => {
     if (r.st[i] === '-') return '';
     const s = lifecycle(r, i);
-    const extra = s.version ? ' — ' + s.version : '';
+    const extra = s.version ? ' in ' + s.version : '';
     return '<span class="pill ' + s.code + '" title="' +
       esc(col.label + ': ' + s.word + extra) + '">' +
       esc(col.suite) + '</span>';
@@ -628,7 +628,7 @@ function detailHtml(r, d) {
       '<p class="desc">' + esc(d.desc || 'No description published.') + '</p>' +
       (d.files && d.files.length
         ? '<h3>Where it lives</h3>' +
-          '<p class="panel-note">The fix touches these files — if the subsystem ' +
+          '<p class="panel-note">The fix touches these files. If the subsystem ' +
           'is one you do not use, the practical exposure is lower, though the ' +
           'package is still the vulnerable one.</p>' +
           '<p class="files">' + d.files.map(esc).join('<br>') + '</p>'
@@ -646,7 +646,7 @@ function detailHtml(r, d) {
             '<br><span class="mono dim">' + esc(d.vector || '') + '</span>'
           : '<span class="dim">no vector published</span>') + '</dd>' +
         '<dt>EPSS</dt><dd>' + (r.epss !== undefined
-          ? (r.epss * 100).toFixed(2) + '% — higher than ' + (r.epct * 100).toFixed(1) + '% of all CVEs'
+          ? (r.epss * 100).toFixed(2) + '%, higher than ' + (r.epct * 100).toFixed(1) + '% of all CVEs'
           : '<span class="dim">not scored</span>') + '</dd>' +
         '<dt>KEV</dt><dd>' + (r.kev ? 'listed' : '<span class="dim">not listed</span>') + '</dd>' +
         '<dt>Debian urgency</dt><dd>' + esc(r.urg || 'not yet assigned') + '</dd>' +

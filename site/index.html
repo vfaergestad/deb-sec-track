@@ -32,7 +32,7 @@
     <h2 id="hero-h" class="hero-h">Look up a kernel CVE</h2>
     <div class="hero-search">
       <input type="search" id="q" autocomplete="off" spellcheck="false"
-             placeholder="CVE-2026-93204 — or a subsystem, like ksmbd, nftables, io_uring">
+             placeholder="CVE-2026-93204, or a subsystem like ksmbd, nftables, io_uring">
       <button type="button" id="clear-q" class="ghost" hidden>Clear</button>
     </div>
     <p class="hero-hint" id="hero-hint">
@@ -179,7 +179,7 @@
         <h3 class="explain-h">Triage signals</h3>
         <dl class="explain-dl">
           <dt><span class="badge kev">KEV</span></dt>
-          <dd>Listed in <a href="https://www.cisa.gov/known-exploited-vulnerabilities-catalog">CISA's Known Exploited Vulnerabilities</a> catalogue — there is evidence of exploitation in the wild. The strongest signal on this page.</dd>
+          <dd>Listed in <a href="https://www.cisa.gov/known-exploited-vulnerabilities-catalog">CISA's Known Exploited Vulnerabilities</a> catalogue, meaning there is evidence of exploitation in the wild. The strongest signal on this page.</dd>
           <dt><span class="badge ransom">ransomware</span></dt>
           <dd>That KEV record carries <code>knownRansomwareCampaignUse: "Known"</code>.</dd>
           <dt><span class="badge epss">EPSS</span></dt>
@@ -204,8 +204,8 @@
 
   <footer class="page-foot">
     <p>
-      Every CVE also has a plain page of its own that needs no JavaScript —
-      see <a href="sitemap.xml">the sitemap</a> for the full list.
+      Every CVE also has a plain page of its own that needs no JavaScript.
+      See <a href="sitemap.xml">the sitemap</a> for the full list.
     </p>
     <p>
       Data from the
