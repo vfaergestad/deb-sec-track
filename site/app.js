@@ -16,6 +16,15 @@ const DAY = 86400;
 const NEW_WINDOW = 30;    // days that count as "latest"
 const FIXED_WINDOW = 90;  // days back that "recently fixed" covers
 
+const STAR_KEY = 'starred';
+const HISTORY_KEY = 'searches';
+const STAR_MAX = 500;     // stars kept in storage
+const SHARE_MAX = 50;     // ids a shared link will carry
+const HISTORY_MAX = 8;    // recent lookups kept
+const QUERY_MAX = 64;     // characters kept per recorded lookup
+const QUERY_MIN = 3;      // shorter than this is still being typed
+const SETTLE_MS = 1200;   // pause in typing that counts as a committed search
+
 const CVE_RE = /^CVE-\d{4}-\d{4,}$/i;
 const $ = (sel) => document.querySelector(sel);
 
@@ -68,6 +77,16 @@ const VIEWS = [
       'became its own CNA in 2024.',
     match: () => true,
   },
+  {
+    id: 'starred',
+    label: 'Starred',
+    sort: 'triage',
+    title: 'Starred CVEs',
+    note: 'The CVEs starred in this browser. A star is a bookmark and nothing ' +
+      'more: it changes nothing about what Debian reports, and the site still ' +
+      'knows nothing about any machine.',
+    match: (r) => (shared ? shared.has(r.id) : starred.has(r.id)),
+  },
 ];
 
 const state = {
@@ -82,6 +101,16 @@ let rendered = 0;
 let openCve = null;
 const detailCache = new Map();
 const deepText = new Map();
+
+/* Bookmarks the reader chose, most recently starred first, and the recent
+ * lookups offered back under the search box.  Both live only in this browser.
+ * `shared` is the set carried by a #stars= link, which stands in for the
+ * reader's own stars while such a link is open and is never written to
+ * storage. */
+let starred = new Set();
+let recent = [];
+let shared = null;
+let settleTimer = 0;
 
 /* ---------------------------------------------------------------- utils */
 
@@ -176,10 +205,230 @@ function advice(r, i, d) {
   }
 }
 
+/* ------------------------------------------------------------- storage */
+
+/* localStorage throws outright in some private windows and whenever site data
+ * is blocked, so every read and every write is wrapped, the same way the theme
+ * toggle has always done it.  A failure costs the reader persistence and
+ * nothing else: the page carries on with whatever is in memory. */
+function storeGet(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch (e) {
+    return null;
+  }
+}
+
+function storeSet(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (e) {
+    /* Private window, blocked site data, or a full quota. Nothing to do. */
+  }
+}
+
+/* Whatever comes back out of storage was written by an older version of this
+ * page, or by hand, or truncated halfway.  Treat it as untrusted text: parse
+ * defensively, keep only values that still validate, and fall back to an
+ * empty list rather than letting a bad value reach the rest of the page. */
+function parseList(raw, limit, clean, keyOf) {
+  let list = null;
+  try {
+    list = JSON.parse(raw);
+  } catch (e) {
+    return [];
+  }
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of list) {
+    if (typeof item !== 'string') continue;
+    const value = clean(item);
+    if (!value) continue;
+    const key = keyOf(value);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+const cleanCve = (s) => (CVE_RE.test(s.trim()) ? s.trim().toUpperCase() : '');
+const cleanQuery = (s) => s.replace(/\s+/g, ' ').trim().slice(0, QUERY_MAX);
+const lower = (s) => s.toLowerCase();
+
+/* ---------------------------------------------------------------- stars */
+
+function loadStars() {
+  starred = new Set(parseList(storeGet(STAR_KEY), STAR_MAX, cleanCve, (s) => s));
+}
+
+function saveStars() {
+  storeSet(STAR_KEY, JSON.stringify([...starred]));
+}
+
+function toggleStar(id) {
+  if (starred.has(id)) {
+    starred.delete(id);
+  } else {
+    // Newest first, so a shared link that has to truncate carries the stars
+    // the reader added most recently.
+    starred = new Set([id, ...starred]);
+    if (starred.size > STAR_MAX) starred = new Set([...starred].slice(0, STAR_MAX));
+  }
+  saveStars();
+  syncStarControls(id);
+  renderViewCounts();
+  renderStarBar();
+}
+
+const starLabel = (id, on) => (on ? 'Unstar ' : 'Star ') + id;
+
+/* The row control and the one in the open detail panel are the same star and
+ * must agree, so a toggle updates every control for that CVE on the page. */
+function syncStarControls(id) {
+  const on = starred.has(id);
+  document.querySelectorAll('button.star[data-cve="' + id + '"]').forEach((btn) => {
+    btn.setAttribute('aria-pressed', String(on));
+    btn.setAttribute('aria-label', starLabel(id, on));
+    btn.title = starLabel(id, on);
+    const glyph = btn.querySelector('.star-glyph');
+    if (glyph) glyph.textContent = on ? '★' : '☆';
+    const text = btn.querySelector('.star-text');
+    if (text) text.textContent = on ? 'Starred' : 'Star';
+  });
+}
+
+/* `wide` is the labelled version used inside the detail panel; rows get the
+ * bare glyph. */
+function starHtml(id, wide) {
+  const on = starred.has(id);
+  const label = esc(starLabel(id, on));
+  return '<button type="button" class="star' + (wide ? ' star-wide' : '') +
+    '" data-cve="' + esc(id) + '" aria-pressed="' + (on ? 'true' : 'false') +
+    '" aria-label="' + label + '" title="' + label + '">' +
+    '<span class="star-glyph" aria-hidden="true">' + (on ? '★' : '☆') + '</span>' +
+    (wide ? '<span class="star-text">' + (on ? 'Starred' : 'Star') + '</span>' : '') +
+    '</button>';
+}
+
+/* ------------------------------------------------------- recent lookups */
+
+function loadHistory() {
+  recent = parseList(storeGet(HISTORY_KEY), HISTORY_MAX, cleanQuery, lower);
+}
+
+function saveHistory() {
+  storeSet(HISTORY_KEY, JSON.stringify(recent));
+}
+
+/* The box filters on every keystroke, so recording on input would fill this
+ * list with the prefixes of one word.  A lookup counts as committed only when
+ * the reader signals they meant it: Enter, opening a result, or leaving the
+ * box alone for SETTLE_MS. */
+function recordSearch(raw) {
+  const q = cleanQuery(String(raw || ''));
+  if (q.length < QUERY_MIN) return;
+  const key = lower(q);
+  recent = recent.filter((h) => lower(h) !== key);
+  // Typing "ksm", pausing, then finishing "ksmbd" is one lookup, not two.
+  if (recent.length) {
+    const prev = lower(recent[0]);
+    if (prev.startsWith(key) || key.startsWith(prev)) recent.shift();
+  }
+  recent.unshift(q);
+  recent = recent.slice(0, HISTORY_MAX);
+  saveHistory();
+  renderHistory();
+}
+
+function renderHistory() {
+  const host = $('#history');
+  if (!host) return;
+  host.hidden = recent.length === 0;
+  $('#history-chips').innerHTML = recent.map((q) =>
+    '<button type="button" class="histchip" data-q="' + esc(q) +
+    '" title="Search again for ' + esc(q) + '">' + esc(q) + '</button>').join('');
+}
+
+function clearHistory() {
+  recent = [];
+  saveHistory();
+  renderHistory();
+}
+
+/* Re-running a recorded lookup behaves exactly like typing it and committing
+ * it, which also moves it back to the front of the list. */
+function runQuery(q) {
+  clearTimeout(settleTimer);
+  const typed = cleanQuery(String(q || ''));
+  state.q = typed;
+  state.view = 'all';
+  apply();
+  recordSearch(typed);
+  if (CVE_RE.test(typed)) {
+    focusCve(typed.toUpperCase());
+    return;
+  }
+  $('#q').focus({ preventScroll: true });
+}
+
+/* ------------------------------------------------------- shared star set */
+
+/* A starred set travels in the address bar, so sharing needs no server and
+ * stores nothing anywhere.  The ids arrive from someone else's browser, so
+ * validate every one and cap the count. */
+function setShared(raw) {
+  const ids = [];
+  const seen = new Set();
+  for (const part of String(raw || '').split(',')) {
+    const id = ('CVE-' + part.trim()).toUpperCase();
+    if (!CVE_RE.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= SHARE_MAX) break;
+  }
+  shared = ids.length ? new Set(ids) : null;
+}
+
+function shareLink() {
+  const ids = [...starred].slice(0, SHARE_MAX).map((id) => id.slice(4));
+  return location.origin + location.pathname + location.search +
+    '#view=starred&stars=' + ids.join(',');
+}
+
+function legacyCopy(text) {
+  try {
+    const box = document.createElement('textarea');
+    box.value = text;
+    box.setAttribute('readonly', '');
+    box.style.position = 'fixed';
+    box.style.top = '-1000px';
+    document.body.appendChild(box);
+    box.select();
+    const ok = document.execCommand('copy');
+    box.remove();
+    return ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text)
+      .then(() => true, () => legacyCopy(text));
+  }
+  return Promise.resolve(legacyCopy(text));
+}
+
 /* ------------------------------------------------------------- loading */
 
 async function boot() {
   applyStoredTheme();
+  loadStars();
+  loadHistory();
   const [m, idx] = await Promise.all([
     fetch('data/meta.json').then((r) => r.json()),
     fetch('data/index.json').then((r) => r.json()),
@@ -195,6 +444,7 @@ async function boot() {
   buildAreaOptions();
   $('#deep-size').textContent = '(~' + Math.round(meta.total * 1.4 / 1000) + ' MB)';
   wireControls();
+  renderHistory();
   readHash();
   apply();
 }
@@ -314,6 +564,8 @@ function wireControls() {
   $('#q').addEventListener('input', (e) => {
     state.q = e.target.value;
     const typed = state.q.trim();
+    clearTimeout(settleTimer);
+    if (typed) settleTimer = setTimeout(() => recordSearch(typed), SETTLE_MS);
     if (CVE_RE.test(typed)) {
       state.view = 'all';
       apply();
@@ -324,11 +576,47 @@ function wireControls() {
     apply();
   });
 
+  // Enter is the reader saying they meant this one, so it commits at once.
+  $('#q').addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    clearTimeout(settleTimer);
+    recordSearch(state.q);
+  });
+
   $('#clear-q').addEventListener('click', () => {
+    clearTimeout(settleTimer);
     state.q = '';
     state.view = 'latest';
     apply();
     $('#q').focus();
+  });
+
+  $('#history-chips').addEventListener('click', (e) => {
+    const btn = e.target.closest('button.histchip');
+    if (btn) runQuery(btn.dataset.q);
+  });
+
+  $('#clear-history').addEventListener('click', () => {
+    clearHistory();
+    $('#q').focus({ preventScroll: true });
+  });
+
+  // A row is a click target of its own, so the star has to claim the event
+  // before the row sees it.  Capture phase does that for mouse and keyboard
+  // alike, since a keyboard activation on a button fires an ordinary click.
+  $('#tbody').addEventListener('click', (e) => {
+    const btn = e.target.closest('button.star');
+    if (!btn) return;
+    e.stopPropagation();
+    e.preventDefault();
+    toggleStar(btn.dataset.cve);
+  }, true);
+
+  $('#copy-stars').addEventListener('click', onCopyStars);
+
+  $('#exit-shared').addEventListener('click', () => {
+    shared = null;
+    apply();
   });
 
   $('#deep').addEventListener('change', async (e) => {
@@ -352,8 +640,17 @@ function wireControls() {
   io.observe($('#sentinel'));
 
   window.addEventListener('hashchange', () => {
-    const cve = location.hash.slice(1);
-    if (CVE_RE.test(cve) && cve !== openCve) focusCve(cve.toUpperCase());
+    const raw = location.hash.slice(1);
+    if (CVE_RE.test(raw) && raw !== openCve) { focusCve(raw.toUpperCase()); return; }
+    // A starred-set link pasted into a tab that is already on this page
+    // changes the hash without reloading, so readHash never runs again.
+    const part = raw.split('&').find((p) => p.startsWith('stars='));
+    const next = part ? decodeURIComponent(part.slice(6)) : '';
+    const now = shared ? [...shared].map((id) => id.slice(4)).join(',') : '';
+    if (next === now) return;
+    setShared(next);
+    if (shared) state.view = 'starred';
+    apply();
   });
 }
 
@@ -369,6 +666,55 @@ function syncControls() {
   document.querySelectorAll('.view-tab').forEach((b) => {
     b.setAttribute('aria-pressed', String(b.dataset.view === state.view));
   });
+}
+
+/* The bar above the Starred view: what this set is, and how to hand it to
+ * someone else.  Hidden everywhere else, so no other view changes. */
+function renderStarBar() {
+  const bar = $('#starbar');
+  if (!bar) return;
+  const n = shared ? shared.size : starred.size;
+
+  if (shared && state.view === 'starred' && !state.q.trim()) {
+    $('#view-title').textContent = 'Starred CVEs from a shared link';
+    $('#view-note').textContent = 'Exactly the CVEs the link carries. The ids ' +
+      'travel in the address, so nothing was uploaded and nothing was read ' +
+      'about the machine at either end.';
+  }
+
+  // With nothing on screen there is nothing to say about it, and the empty
+  // state below explains the view on its own.
+  bar.hidden = state.view !== 'starred' || n === 0 || filtered.length === 0;
+  if (bar.hidden) return;
+
+  $('#exit-shared').hidden = !shared;
+  $('#copy-stars').hidden = !!shared;
+  $('#starbar-note').textContent = shared
+    ? 'Showing the ' + n + ' CVE' + (n === 1 ? '' : 's') + ' this link carries, ' +
+      'and nothing else. Star any of them to keep it in this browser as well.'
+    : n > SHARE_MAX
+      ? 'A shared link carries at most ' + SHARE_MAX + ' CVEs, so a link copied ' +
+        'now covers the ' + SHARE_MAX + ' most recently starred of these ' +
+        n.toLocaleString() + '.'
+      : 'Copy a link that opens this exact set for someone else. The ids ' +
+        'travel in the address, so nothing is uploaded anywhere.';
+}
+
+async function onCopyStars() {
+  const btn = $('#copy-stars');
+  const link = shareLink();
+  if (await copyText(link)) {
+    btn.textContent = 'Link copied';
+    setTimeout(() => {
+      btn.textContent = 'Copy link to these';
+      renderStarBar();
+    }, 2500);
+    return;
+  }
+  // A browser can refuse clipboard access outright. Leave the link on screen
+  // to be selected by hand rather than leaving the reader with nothing.
+  $('#starbar-note').textContent = 'Copying was blocked by the browser. ' +
+    'The link is ' + link;
 }
 
 async function loadAllDetails() {
@@ -427,6 +773,7 @@ function apply() {
   $('#empty').hidden = filtered.length > 0;
   $('#empty').textContent = emptyMessage();
   $('#hero-hint').textContent = heroHint();
+  renderStarBar();
 
   $('#tbody').innerHTML = '';
   rendered = 0;
@@ -456,6 +803,15 @@ function emptyMessage() {
       'another package.';
   }
   if (typed) return 'No kernel CVE matches that. Try a subsystem name, like ksmbd or nftables.';
+  if (state.view === 'starred') {
+    if (shared) {
+      return 'That link carries no CVE this site tracks. It may have been cut ' +
+        'short in transit, or point at CVEs in another package.';
+    }
+    return 'Nothing starred yet. Every result row starts with a star button, ' +
+      'and so does each CVE once you open it. Star one and it stays here, in ' +
+      'this browser, the next time you come back.';
+  }
   if (state.view === 'exploited') {
     return 'No kernel CVE in the CISA KEV catalogue matches these filters.';
   }
@@ -537,6 +893,7 @@ function rowEl(r) {
   tr.className = 'row';
   tr.dataset.cve = r.id;
   tr.innerHTML =
+    '<td class="starcell">' + starHtml(r.id, false) + '</td>' +
     '<td class="cve">' + esc(r.id) + '</td>' +
     '<td class="when">' + fmtDate(r.pub) +
       (r.pub ? '<span class="sub">' + agoLabel(r.pub) + '</span>' : '') + '</td>' +
@@ -564,9 +921,15 @@ async function toggleDetail(tr, r) {
   openCve = r.id;
   writeHash();
 
+  // Opening a result is the reader saying the query in the box worked.
+  if (state.q.trim()) {
+    clearTimeout(settleTimer);
+    recordSearch(state.q);
+  }
+
   const holder = document.createElement('tr');
   holder.className = 'detail';
-  holder.innerHTML = '<td colspan="5"><div class="detail dim">Loading…</div></td>';
+  holder.innerHTML = '<td colspan="6"><div class="detail dim">Loading…</div></td>';
   tr.after(holder);
 
   const chunk = await loadChunk(r.c);
@@ -619,6 +982,7 @@ function detailHtml(r, d) {
     '</dl></div>') : '';
 
   return '<div class="detail">' +
+    '<div class="detail-tools">' + starHtml(r.id, true) + '</div>' +
     '<h3>What to do, per Debian release</h3>' +
     '<div class="tablewrap"><table class="answer"><thead><tr>' +
       '<th>Release</th><th>Status</th><th>Version</th><th>What this means</th>' +
@@ -692,6 +1056,9 @@ function writeHash() {
   for (const [k, v] of Object.entries(def)) {
     if (state[k] !== v) parts.push(k + '=' + encodeURIComponent(state[k]));
   }
+  // Ids only, with the constant CVE- prefix dropped: a fifty-CVE set is a few
+  // hundred characters, which every browser and chat client carries intact.
+  if (shared) parts.push('stars=' + [...shared].map((id) => id.slice(4)).join(','));
   if (openCve) parts.push('cve=' + openCve);
   history.replaceState(null, '', location.pathname + location.search +
     (parts.length ? '#' + parts.join('&') : ''));
@@ -701,14 +1068,19 @@ function readHash() {
   const raw = location.hash.slice(1);
   if (!raw) return;
   if (CVE_RE.test(raw)) { openCve = raw.toUpperCase(); return; }
+  let sawView = false;
   for (const part of raw.split('&')) {
     const [k, v] = part.split('=');
     const value = decodeURIComponent(v ?? '');
     if (k === 'cve') { openCve = value.toUpperCase(); continue; }
+    if (k === 'stars') { setShared(value); continue; }
     if (!(k in state)) continue;
+    if (k === 'view') sawView = true;
     if (typeof state[k] === 'boolean') state[k] = value === '1';
     else state[k] = value;
   }
+  // A bare #stars= link is a starred set, so land on it rather than on Latest.
+  if (shared && !sawView) state.view = 'starred';
   if (state.rel !== 'any' || state.status !== 'any' || state.area !== 'any') {
     $('#refine').open = true;
   }

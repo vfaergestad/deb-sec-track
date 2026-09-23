@@ -39,6 +39,11 @@
       Paste a CVE id to jump straight to it, or search by subsystem to see
       what has been found there.
     </p>
+    <div class="history" id="history" hidden>
+      <span class="history-label" id="history-label">Recent lookups</span>
+      <div class="history-chips" id="history-chips" role="group" aria-labelledby="history-label"></div>
+      <button type="button" id="clear-history" class="ghost histclear">Clear</button>
+    </div>
   </section>
 
   <section class="panel" aria-labelledby="overview-h">
@@ -71,6 +76,14 @@
       <span id="view-title">Loading…</span>
     </h2>
     <p class="view-note" id="view-note"></p>
+
+    <div class="starbar" id="starbar" hidden>
+      <p class="starbar-note" id="starbar-note" aria-live="polite"></p>
+      <div class="starbar-actions">
+        <button type="button" id="copy-stars" class="ghost">Copy link to these</button>
+        <button type="button" id="exit-shared" class="ghost" hidden>Show the stars in this browser</button>
+      </div>
+    </div>
 
     <details class="refine" id="refine">
       <summary>More filters</summary>
@@ -137,6 +150,7 @@
       <table id="table">
         <thead>
           <tr>
+            <th scope="col" class="c-star"><span class="vh">Starred</span></th>
             <th scope="col" class="c-cve">CVE</th>
             <th scope="col" class="c-when" id="when-head">Published</th>
             <th scope="col" class="c-sum">What it is</th>

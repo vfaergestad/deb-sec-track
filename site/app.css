@@ -703,3 +703,131 @@ td.sum .sub {
   color: var(--ink-dim);
   margin-top: 2px;
 }
+
+/* ---------- starring ---------- */
+
+/* Available to a screen reader, invisible on screen: used for the star
+   column's header, which needs a name but no width. */
+.vh {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.c-star { width: 1%; }
+td.starcell { padding: 5px 2px 5px 6px; }
+
+.star {
+  font: inherit;
+  line-height: 1;
+  color: var(--ink-dim);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: 3px 5px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.star:hover { color: var(--amber); border-color: var(--line); }
+.star:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.star[aria-pressed="true"] { color: var(--amber); }
+.star-glyph { font-size: 17px; }
+
+.star-wide {
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--panel);
+  border-color: var(--line);
+  padding: 5px 12px;
+}
+.star-wide:hover { color: var(--ink); border-color: var(--amber); }
+.star-wide[aria-pressed="true"] { color: var(--amber); border-color: var(--amber); }
+
+.detail-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding-top: 14px;
+}
+.detail-tools + h3 { margin-top: 10px; }
+
+/* ---------- starred-set bar ---------- */
+
+.starbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin: 0 0 14px;
+}
+.starbar-note {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-dim);
+  max-width: 78ch;
+}
+/* `display: flex` outranks the user agent's rule for [hidden]. */
+.starbar[hidden] { display: none; }
+.starbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* ---------- recent lookups ---------- */
+
+.history {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px 10px;
+  margin-top: 11px;
+}
+.history[hidden] { display: none; }
+.history-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-dim);
+}
+.history-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+.histchip {
+  font: 12.5px/1.5 var(--sans);
+  color: var(--link);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 12px;
+  cursor: pointer;
+  max-width: 26ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.histchip:hover { border-color: var(--link); }
+.histchip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.histclear { font-size: 12px; padding: 4px 10px; }
