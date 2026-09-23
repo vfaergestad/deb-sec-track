@@ -28,6 +28,35 @@ const SETTLE_MS = 1200;   // pause in typing that counts as a committed search
 const CVE_RE = /^CVE-\d{4}-\d{4,}$/i;
 const $ = (sel) => document.querySelector(sel);
 
+/* Where each published value comes from.  The whole claim this site makes is
+ * that every number on it is a lookup in somebody else's published file, so
+ * every number carries a link to that file.  Each of these was checked to
+ * return 200; where a source has no per-CVE page, the closest honest thing is
+ * linked instead and said to be exactly that. */
+const VULNS_TREE = 'https://git.kernel.org/pub/scm/linux/security/vulns.git/tree/cve/published/';
+const VULNS_LOG = 'https://git.kernel.org/pub/scm/linux/security/vulns.git/log/cve/published/';
+const TRACKER = 'https://security-tracker.debian.org/tracker/';
+const KEV_CATALOG = 'https://www.cisa.gov/known-exploited-vulnerabilities-catalog';
+const EPSS_API = 'https://api.first.org/data/v1/epss?pretty=true&cve=';
+const CVSS_CALC = 'https://www.first.org/cvss/calculator/3.1#';
+
+/* CVSS v3.1 attack vector letters, straight from the spec's own legend. */
+const AV_WORDS = { N: 'network', A: 'adjacent network', L: 'local', P: 'physical' };
+
+/* The eight base metrics in vector order: code, name, the value that scores
+ * worst for that metric, and the spec's word for each value.  All of it is
+ * copied from the CVSS v3.1 specification; nothing here is a judgement. */
+const CVSS_METRICS = [
+  ['AV', 'Attack vector', 'N', AV_WORDS],
+  ['AC', 'Attack complexity', 'L', { L: 'low', H: 'high' }],
+  ['PR', 'Privileges required', 'N', { N: 'none', L: 'low', H: 'high' }],
+  ['UI', 'User interaction', 'N', { N: 'none', R: 'required' }],
+  ['S', 'Scope', 'C', { U: 'unchanged', C: 'changed' }],
+  ['C', 'Confidentiality impact', 'H', { H: 'high', L: 'low', N: 'none' }],
+  ['I', 'Integrity impact', 'H', { H: 'high', L: 'low', N: 'none' }],
+  ['A', 'Availability impact', 'H', { H: 'high', L: 'low', N: 'none' }],
+];
+
 const VIEWS = [
   {
     id: 'latest',
@@ -100,6 +129,7 @@ let filtered = [];
 let rendered = 0;
 let openCve = null;
 const detailCache = new Map();
+const rationaleCache = new Map();
 const deepText = new Map();
 
 /* Bookmarks the reader chose, most recently starred first, and the recent
@@ -119,6 +149,54 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
 ));
 
 const fmtDate = (ts) => (ts ? new Date(ts * 1000).toISOString().slice(0, 10) : 'unknown');
+
+/* ------------------------------------------------------------- citations */
+
+/* One file per CVE in the kernel CNA's vulns.git: .json is the record, .cvss
+ * the vector and the written reasoning, .dyad the introduced/fixed version
+ * pairs.  They exist only for CVEs the CNA itself published, which is exactly
+ * the set that has a publication date, so r.pub is the test for the .json. */
+const vulnsFile = (cve, suffix) => VULNS_TREE + cve.split('-')[1] + '/' + cve + '.' + suffix;
+const vulnsLog = (cve) => VULNS_LOG + cve.split('-')[1] + '/' + cve + '.json';
+
+/* The published text of a DSA or DLA. Debian files both by year and number,
+ * and the advisory's own date supplies the year. */
+function advisoryUrl(id, date) {
+  const m = /^(DSA|DLA)-(\d+)/.exec(id || '');
+  const year = String(date || '').slice(0, 4);
+  if (!m || !/^\d{4}$/.test(year)) return '';
+  return m[1] === 'DSA'
+    ? 'https://www.debian.org/security/' + year + '/dsa-' + m[2]
+    : 'https://www.debian.org/lts/security/' + year + '/dla-' + m[2];
+}
+
+/* Anything off this site opens in a new tab, so the reader keeps their place,
+ * and carries rel="noopener".  `label` is given only where the visible text is
+ * too generic to stand on its own in a list of links; where the text is an
+ * advisory id or a heading it is the accessible name already, and a repeated
+ * aria-label would only be noise on a page carrying thirty of them. */
+function ext(url, text, label) {
+  return '<a href="' + esc(url) + '" target="_blank" rel="noopener"' +
+    (label ? ' aria-label="' + esc(label) + '"' : '') + '>' + esc(text) + '</a>';
+}
+
+/* The small "source" link that sits beside a value.  Its visible text is the
+ * same word every time, so the label always names what it points at.  `text`
+ * overrides that word where the link does not go to a per-CVE page and saying
+ * "source" would promise more than it delivers. */
+function src(url, label, text) {
+  return '<a class="src" href="' + esc(url) + '" target="_blank" rel="noopener" ' +
+    'aria-label="' + esc(label) + '">' + esc(text || 'source') + '</a>';
+}
+
+function vectorParts(vector) {
+  const out = {};
+  for (const part of String(vector || '').split('/')) {
+    const [k, v] = part.split(':');
+    if (k && v) out[k] = v;
+  }
+  return out;
+}
 
 function ageLabel(ts) {
   if (!ts) return 'unknown';
@@ -456,6 +534,16 @@ async function loadChunk(n) {
   return data;
 }
 
+/* The CNA's written justification for each CVSS metric, cached per chunk the
+ * same way details are.  About 250 KB a chunk, which is why nothing fetches it
+ * on load or on opening a CVE: it waits until the reader presses the button. */
+async function loadRationale(n) {
+  if (rationaleCache.has(n)) return rationaleCache.get(n);
+  const data = await fetch('data/rationale/' + n + '.json').then((r) => r.json());
+  rationaleCache.set(n, data);
+  return data;
+}
+
 /* ------------------------------------------------------------ overview */
 
 function renderOverview() {
@@ -611,6 +699,14 @@ function wireControls() {
     e.preventDefault();
     toggleStar(btn.dataset.cve);
   }, true);
+
+  // The reasoning button lives inside the open detail row, which is a sibling
+  // of the result row rather than part of it, so pressing it never reaches the
+  // row's own click handler and never closes the panel.
+  $('#tbody').addEventListener('click', (e) => {
+    const btn = e.target.closest('button.reasons-btn');
+    if (btn) toggleReasons(btn);
+  });
 
   $('#copy-stars').addEventListener('click', onCopyStars);
 
@@ -936,32 +1032,130 @@ async function toggleDetail(tr, r) {
   holder.querySelector('td').innerHTML = detailHtml(r, chunk[r.id] || {});
 }
 
+/* ------------------------------------------------- CVSS reasoning (lazy) */
+
+/* The kernel CNA writes a paragraph per CVSS metric saying why it scored that
+ * metric the way it did.  It is the only published account of what a score is
+ * based on, and it is the difference between "9.8" and a reason to believe
+ * it, so the expanded CVE offers it whenever the CNA wrote one. */
+function reasonsHtml(cve, vector, reasons) {
+  const v = vectorParts(vector);
+  const items = CVSS_METRICS.map(([code, name, worst, words]) => {
+    const val = v[code] || '';
+    const word = words[val] || '';
+    const top = !!val && val === worst;
+    return '<div class="reason' + (top ? ' top' : '') + '">' +
+      '<dt><span class="metric">' + esc(code + ':' + (val || '?')) + '</span>' +
+      '<span class="metric-name">' + esc(name + (word ? ', ' + word : '')) + '</span></dt>' +
+      '<dd>' + esc(reasons[code] ||
+        'The CNA published no note for this metric.') + '</dd>' +
+      '</div>';
+  }).join('');
+  return '<p class="panel-note">Quoted from the kernel CNA\'s own scoring file, ' +
+    'word for word. A highlighted metric carries the most severe value CVSS v3.1 ' +
+    'defines for it, which is what pushes the score up. ' +
+    src(vulnsFile(cve, 'cvss'), 'Reasoning source: the kernel CNA scoring file') + '</p>' +
+    '<dl class="reasons">' + items + '</dl>';
+}
+
+/* Two thirds of the CVEs here have no vector at all, so the absent case is the
+ * common one and says so plainly rather than offering a control with nothing
+ * behind it. */
+function reasonsBlock(r, d) {
+  const head = '<h3>Why the CNA scored it this way</h3>';
+  if (d.has_reasons) {
+    const id = 'reasons-' + r.id;
+    return '<div class="reasons-block">' + head +
+      '<p class="panel-note">The Linux kernel CNA published a written ' +
+      'justification for each of the eight CVSS metrics. It is fetched only ' +
+      'when you ask for it.</p>' +
+      '<button type="button" class="ghost reasons-btn" data-cve="' + esc(r.id) +
+        '" data-chunk="' + esc(String(r.c)) +
+        '" data-vector="' + esc(d.vector || '') +
+        '" aria-expanded="false" aria-controls="' + esc(id) + '">' +
+        'Show the reasoning for each metric</button>' +
+      '<div class="reasons-out" id="' + esc(id) + '" hidden></div></div>';
+  }
+  const note = d.vector
+    ? 'The kernel CNA published a vector for ' + esc(r.id) + ' but no written ' +
+      'reasoning for the individual metrics, so there is nothing to quote. ' +
+      src(vulnsFile(r.id, 'cvss'), 'Vector source: the kernel CNA scoring file')
+    : 'The kernel CNA published no CVSS vector and no reasoning for ' + esc(r.id) +
+      ', which is why it is shown as unrated rather than given an invented score. ' +
+      (meta.rationale_count
+        ? meta.rationale_count.toLocaleString() + ' of the ' + meta.total.toLocaleString() +
+          ' CVEs here carry reasoning; this is not one of them.'
+        : '');
+  return '<div class="reasons-block">' + head +
+    '<p class="panel-note">' + note + '</p></div>';
+}
+
+async function toggleReasons(btn) {
+  const out = document.getElementById(btn.getAttribute('aria-controls'));
+  if (!out) return;
+  if (!out.hidden) {
+    out.hidden = true;
+    btn.setAttribute('aria-expanded', 'false');
+    btn.textContent = 'Show the reasoning for each metric';
+    return;
+  }
+  if (!out.dataset.filled) {
+    // A second press while the fetch is in flight would start a second one.
+    // A busy flag stops that without disabling the button, which would take
+    // the focus off it and leave a keyboard reader nowhere.
+    if (btn.dataset.busy) return;
+    btn.dataset.busy = '1';
+    btn.textContent = 'Loading the reasoning';
+    try {
+      const chunk = await loadRationale(Number(btn.dataset.chunk));
+      out.innerHTML = reasonsHtml(btn.dataset.cve, btn.dataset.vector,
+        chunk[btn.dataset.cve] || {});
+    } catch (e) {
+      out.innerHTML = '<p class="panel-note">The reasoning file could not be ' +
+        'loaded. ' + src(vulnsFile(btn.dataset.cve, 'cvss'),
+          'Reasoning source: the kernel CNA scoring file') + '</p>';
+    }
+    out.dataset.filled = '1';
+    delete btn.dataset.busy;
+  }
+  out.hidden = false;
+  btn.setAttribute('aria-expanded', 'true');
+  btn.textContent = 'Hide the reasoning';
+}
+
 function detailHtml(r, d) {
-  const year = r.id.split('-')[1];
-  const links = [
-    ['Debian tracker', 'https://security-tracker.debian.org/tracker/' + r.id],
-    ['CVE record', 'https://www.cve.org/CVERecord?id=' + r.id],
-    ['NVD', 'https://nvd.nist.gov/vuln/detail/' + r.id],
-    ['kernel CNA record',
-      'https://git.kernel.org/pub/scm/linux/security/vulns.git/tree/cve/published/' +
-      year + '/' + r.id + '.json'],
-  ];
-  if (d.debianbug) links.push(['Debian bug #' + d.debianbug, 'https://bugs.debian.org/' + d.debianbug]);
-  // A shareable address that renders without JavaScript, for people who land
-  // here from a search engine or paste the link into a ticket.
-  links.unshift(['Permalink for this CVE', 'cve/' + r.id + '.html']);
+  const isCve = CVE_RE.test(r.id);
+  const links = [['Permalink for this CVE', 'cve/' + r.id + '.html', false],
+    ['Debian tracker', TRACKER + r.id, true]];
+  // cve.org and NVD key on a real CVE id; the Debian tracker also carries a
+  // few TEMP-... placeholders for issues that have not been assigned one.
+  if (isCve) {
+    links.push(['CVE record', 'https://www.cve.org/CVERecord?id=' + r.id, true]);
+    links.push(['NVD', 'https://nvd.nist.gov/vuln/detail/' + r.id, true]);
+  }
+  // The CNA record exists only for the CVEs vulns.git itself published, and
+  // the publication date is read out of the commit that added it, so r.pub is
+  // exactly the test for whether that file is there to link to.
+  if (isCve && r.pub) links.push(['kernel CNA record', vulnsFile(r.id, 'json'), true]);
+  if (d.debianbug) {
+    links.push(['Debian bug #' + d.debianbug, 'https://bugs.debian.org/' + d.debianbug, true]);
+  }
 
   // The answer table: one row per release, ending in what to do about it.
   const actionRows = meta.columns.map((col, i) => {
     if (r.st[i] === '-') return '';
     const s = lifecycle(r, i);
+    const advUrl = s.advisory ? advisoryUrl(s.advisory, s.when) : '';
     return '<tr>' +
       '<td><strong>' + esc(col.release || col.suite) + '</strong>' +
         '<span class="sub">' + esc(col.label) + '</span></td>' +
       '<td><span class="state-chip s-' + s.code + '">' + esc(s.word) + '</span>' +
         (s.advisory
-          ? '<span class="sub"><a href="https://security-tracker.debian.org/tracker/' +
-            esc(s.advisory) + '">' + esc(s.advisory) + '</a> · ' + esc(s.when) + '</span>'
+          ? '<span class="sub">' +
+            ext(TRACKER + s.advisory, s.advisory, '') +
+            ' · ' + esc(s.when) +
+            (advUrl ? ' · ' + ext(advUrl, 'text', s.advisory + ' announcement') : '') +
+            '</span>'
           : '') + '</td>' +
       '<td class="mono">' + esc(s.version || col.version || '') + '</td>' +
       '<td class="action">' + esc(advice(r, i, d)) + '</td>' +
@@ -970,8 +1164,19 @@ function detailHtml(r, d) {
 
   const upstreamRows = (d.pairs || []).map(([intro, fixed, sha]) =>
     '<tr><td class="mono">' + esc(intro) + '</td><td class="mono">' + esc(fixed) + '</td>' +
-    '<td><a class="mono" href="https://git.kernel.org/stable/c/' + esc(sha) + '">' +
-    esc(sha) + '</a></td></tr>').join('');
+    '<td>' + ext('https://git.kernel.org/stable/c/' + sha, sha, '') + '</td></tr>').join('');
+
+  const advisoryRows = (d.advisories || []).map((adv) => {
+    const url = advisoryUrl(adv.id, adv.date);
+    const suites = Object.keys(adv.releases || {}).sort()
+      .map((k) => k + ' ' + adv.releases[k]).join(', ');
+    return '<tr><td class="mono">' +
+      (url ? ext(url, adv.id, adv.id + ' announcement') : esc(adv.id)) +
+      '</td><td class="mono">' + esc(adv.date || '') + '</td>' +
+      '<td>' + esc(suites || adv.package || '') + '</td>' +
+      '<td>' + ext(TRACKER + adv.id, 'tracker', adv.id + ' in the Debian tracker') +
+      '</td></tr>';
+  }).join('');
 
   const kevBox = d.kev ? (
     '<div class="kevbox"><h3>Known to be exploited in the wild</h3><dl class="kv">' +
@@ -979,11 +1184,17 @@ function detailHtml(r, d) {
     '<dt>Federal due date</dt><dd>' + esc(d.kev.due || '') + '</dd>' +
     '<dt>Ransomware use</dt><dd>' + (d.kev.ransomware ? 'known' : 'unknown') + '</dd>' +
     (d.kev.action ? '<dt>Required action</dt><dd>' + esc(d.kev.action) + '</dd>' : '') +
-    '</dl></div>') : '';
+    '</dl><p class="srcline">' + src(KEV_CATALOG,
+      'KEV source: the CISA catalogue, which has no per-CVE page',
+      'the KEV catalogue') +
+    '</p></div>') : '';
 
   return '<div class="detail">' +
     '<div class="detail-tools">' + starHtml(r.id, true) + '</div>' +
     '<h3>What to do, per Debian release</h3>' +
+    '<p class="panel-note">Every status below is the one the Debian Security Team ' +
+      'publishes for this CVE. ' +
+      src(TRACKER + r.id, 'Status source: the Debian Security Tracker entry') + '</p>' +
     '<div class="tablewrap"><table class="answer"><thead><tr>' +
       '<th>Release</th><th>Status</th><th>Version</th><th>What this means</th>' +
     '</tr></thead><tbody>' + actionRows + '</tbody></table></div>' +
@@ -998,29 +1209,68 @@ function detailHtml(r, d) {
           '<p class="files">' + d.files.map(esc).join('<br>') + '</p>'
         : '') +
       '<div class="linkrow">' +
-        links.map(([t, u]) => '<a href="' + esc(u) + '">' + esc(t) + '</a>').join('') +
+        links.map(([t, u, external]) => (external
+          ? ext(u, t, '')
+          : '<a href="' + esc(u) + '">' + esc(t) + '</a>')).join('') +
       '</div>' +
     '</div><div>' +
       kevBox +
       '<h3>Signals</h3><dl class="kv">' +
         '<dt>Published</dt><dd>' + fmtDate(r.pub) +
-          (r.pub ? ' <span class="dim">(' + agoLabel(r.pub) + ')</span>' : '') + '</dd>' +
+          (r.pub
+            ? ' <span class="dim">(' + agoLabel(r.pub) + ')</span>' +
+              '<span class="srcline">' + src(vulnsLog(r.id), 'Published date source: the vulns.git commit') + '</span>'
+            : '') + '</dd>' +
         '<dt>CVSS</dt><dd>' + (r.cvss !== undefined
           ? r.cvss.toFixed(1) + ' ' + severityOf(r) +
             '<br><span class="mono dim">' + esc(d.vector || '') + '</span>'
-          : '<span class="dim">no vector published</span>') + '</dd>' +
+          : '<span class="dim">no vector published</span>') +
+          (d.vector
+            ? '<span class="srcline">' +
+              src(vulnsFile(r.id, 'cvss'), 'CVSS source: the kernel CNA scoring file') +
+              ' ' + ext(CVSS_CALC + d.vector, 'recompute it',
+                'Recompute this score in the FIRST CVSS v3.1 calculator') +
+              '</span>'
+            : '') + '</dd>' +
+        '<dt>Attack vector</dt><dd>' + (r.av
+          ? esc((AV_WORDS[r.av] || 'unrecognised') + ' (AV:' + r.av + ')') +
+            '<span class="srcline">' +
+            src(vulnsFile(r.id, 'cvss'), 'Attack vector source: the kernel CNA scoring file') +
+            '</span>'
+          : '<span class="dim">not published</span>') + '</dd>' +
         '<dt>EPSS</dt><dd>' + (r.epss !== undefined
-          ? (r.epss * 100).toFixed(2) + '%, higher than ' + (r.epct * 100).toFixed(1) + '% of all CVEs'
+          ? (r.epss * 100).toFixed(2) + '%, higher than ' + (r.epct * 100).toFixed(1) +
+            '% of all CVEs' +
+            '<span class="srcline">' + src(EPSS_API + r.id, 'EPSS source: the FIRST EPSS record') + '</span>'
           : '<span class="dim">not scored</span>') + '</dd>' +
-        '<dt>KEV</dt><dd>' + (r.kev ? 'listed' : '<span class="dim">not listed</span>') + '</dd>' +
-        '<dt>Debian urgency</dt><dd>' + esc(r.urg || 'not yet assigned') + '</dd>' +
+        '<dt>CISA KEV</dt><dd>' + (r.kev ? 'listed' : '<span class="dim">not listed</span>') +
+          '<span class="srcline">' + src(KEV_CATALOG,
+            'KEV source: the CISA catalogue, which has no per-CVE page',
+            'the KEV catalogue') + '</span></dd>' +
+        '<dt>Debian urgency</dt><dd>' + esc(r.urg || 'not yet assigned') +
+          '<span class="srcline">' + src(TRACKER + r.id, 'Debian urgency source: the Debian Security Tracker') + '</span></dd>' +
         '<dt>Subsystem</dt><dd class="mono">' + esc(d.subsystem || 'unknown') + '</dd>' +
       '</dl>' +
       (upstreamRows
-        ? '<h3>Upstream fixes</h3><table class="mini"><thead><tr><th>Introduced</th>' +
-          '<th>Fixed in</th><th>Commit</th></tr></thead><tbody>' + upstreamRows + '</tbody></table>'
+        ? '<h3>Upstream fixes</h3>' +
+          '<p class="panel-note">The versions the CNA records as introducing and ' +
+          'fixing this, and the commit for each. ' +
+          (isCve && r.pub
+            ? src(vulnsFile(r.id, 'dyad'), 'Upstream version source: the CNA version-pair file')
+            : '') + '</p>' +
+          '<table class="mini"><thead><tr><th>Introduced</th>' +
+          '<th>Fixed in</th><th>Commit</th></tr></thead><tbody>' + upstreamRows +
+          '</tbody></table>'
         : '') +
-    '</div></div></div>';
+      (advisoryRows
+        ? '<h3>Debian advisories</h3>' +
+          '<div class="tablewrap"><table class="mini"><thead><tr><th>Advisory</th>' +
+          '<th>Date</th><th>Shipped to</th><th>Debian</th></tr></thead><tbody>' +
+          advisoryRows + '</tbody></table></div>'
+        : '') +
+    '</div></div>' +
+    reasonsBlock(r, d) +
+    '</div>';
 }
 
 function seriesOf(version) {

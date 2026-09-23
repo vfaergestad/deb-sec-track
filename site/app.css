@@ -831,3 +831,92 @@ td.starcell { padding: 5px 2px 5px 6px; }
   outline-offset: 1px;
 }
 .histclear { font-size: 12px; padding: 4px 10px; }
+
+/* ---------- source citations ---------- */
+
+/* Every published value carries a link to the file that published it. Kept
+   small and on a line of its own so the value stays the thing you read, and
+   the citation is there when you want to check it. */
+.srcline {
+  display: block;
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--ink-dim);
+}
+.srcline a { margin-right: 10px; }
+a.src {
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+a.src::after {
+  content: "\2197";
+  padding-left: 2px;
+}
+.kevbox .srcline { margin-top: 8px; }
+
+/* ---------- CVSS reasoning ---------- */
+
+.reasons-block {
+  border-top: 1px solid var(--line-soft);
+  margin-top: 18px;
+  padding-top: 2px;
+}
+.reasons-block .panel-note { margin-bottom: 10px; }
+.reasons-out[hidden] { display: none; }
+.reasons-out .panel-note { margin: 12px 0 0; }
+
+.reasons {
+  margin: 10px 0 0;
+  display: grid;
+}
+.reason {
+  display: grid;
+  /* A fixed first column, not max-content: every metric is its own grid, and
+     sizing to content would leave the explanations starting at eight
+     different places down the list. */
+  grid-template-columns: minmax(0, 14.5rem) minmax(0, 1fr);
+  gap: 3px 18px;
+  align-items: baseline;
+  padding: 9px 0;
+  border-top: 1px solid var(--line-soft);
+}
+.reason dt {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+}
+.reason dd {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  max-width: 88ch;
+  /* The CNA writes call chains like a->b->c that have no break opportunity
+     and would otherwise run off a phone screen. */
+  overflow-wrap: anywhere;
+}
+.metric {
+  font: 600 11px/1.5 var(--mono);
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  color: var(--grey);
+  background: var(--grey-bg);
+  white-space: nowrap;
+}
+.reason.top .metric {
+  color: var(--amber);
+  background: var(--amber-bg);
+  border-color: var(--amber);
+}
+.metric-name {
+  font-size: 12.5px;
+  color: var(--ink-dim);
+}
+.reason.top .metric-name { color: var(--ink); }
+
+@media (max-width: 560px) {
+  .reason { grid-template-columns: minmax(0, 1fr); gap: 5px; }
+}
