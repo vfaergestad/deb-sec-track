@@ -345,6 +345,37 @@ def severity_of(score: float | None) -> str:
 
 VERSION_RE = re.compile(r"^\d+\.\d+")
 
+# "AV:N - The flaw is in skb_gro_receive() ..." followed by indented
+# continuation lines.  The kernel CNA writes one of these per CVSS metric,
+# which is the only place the reasoning behind a score is published.
+CVSS_REASON_RE = re.compile(r"^([A-Z]{1,2}):([A-Z])\s+-\s+(.*)$")
+
+
+def parse_cvss_reasons(text: str) -> dict[str, str]:
+    """Metric code -> the CNA's written justification for that metric."""
+    reasons: dict[str, str] = {}
+    metric = None
+    parts: list[str] = []
+
+    def flush() -> None:
+        if metric and parts:
+            reasons[metric] = " ".join(" ".join(parts).split())
+
+    for line in text.split("\n")[1:]:  # line 0 is the vector itself
+        head = CVSS_REASON_RE.match(line)
+        if head:
+            flush()
+            metric, parts = head.group(1), [head.group(3)]
+        elif metric and line.startswith((" ", "\t")) and line.strip():
+            parts.append(line.strip())
+        elif not line.strip():
+            continue
+        else:
+            flush()
+            metric, parts = None, []
+    flush()
+    return reasons
+
 
 def parse_dyad(path: Path) -> list[dict]:
     """Parse a .dyad file into introduced/fixed version pairs."""
@@ -403,11 +434,14 @@ def load_kernel_records(repo: Path) -> dict[str, dict]:
 
         cvss_file = json_path.with_suffix(".cvss")
         if cvss_file.exists():
-            first = cvss_file.read_text(encoding="utf-8", errors="replace").split("\n", 1)[0]
-            for token in first.split():
+            raw = cvss_file.read_text(encoding="utf-8", errors="replace")
+            for token in raw.split("\n", 1)[0].split():
                 if token.startswith("CVSS:"):
                     record["cvss_vector"] = token
                     break
+            reasons = parse_cvss_reasons(raw)
+            if reasons:
+                record["cvss_reasons"] = reasons
 
         records[cve] = record
     log(f"kernel.org: {len(records)} published CVE records")
@@ -652,6 +686,10 @@ def assemble(
     all_cves = sorted({cve for pkg in packages.values() for cve in pkg})
     rows = []
     details: dict[str, dict] = {}
+    # Kept out of the detail chunks: the justification text is ~2 KB per CVE
+    # and most readers never open it, so it is served from its own files and
+    # fetched only when someone actually asks why a score is what it is.
+    reasons: dict[str, dict] = {}
 
     for cve in all_cves:
         codes = []
@@ -748,6 +786,9 @@ def assemble(
             row["pr"] = parts.get("PR", "")
         rows.append(row)
 
+        if rec.get("cvss_reasons"):
+            reasons[cve] = rec["cvss_reasons"]
+
         details[cve] = {
             "desc": rec.get("description") or deb.get("description", ""),
             "vector": vector,
@@ -757,6 +798,7 @@ def assemble(
             "debianbug": deb.get("debianbug"),
             "scope": deb.get("scope"),
             "subsystem": subsystem,
+            "has_reasons": bool(rec.get("cvss_reasons")),
             "kev": kev_entry,
             "advisories": advs,
             "pending": pending,
@@ -769,7 +811,7 @@ def assemble(
     for n, row in enumerate(rows):
         row["c"] = n // DETAIL_CHUNK
 
-    return rows, details
+    return rows, details, reasons
 
 
 def first_sentence(text: str, limit: int = 160) -> str:
@@ -911,7 +953,7 @@ def main() -> None:
     for col in columns:
         col["version"] = versions.get(col["id"], "")
 
-    rows, details = assemble(
+    rows, details, reasons = assemble(
         packages, kernel, dates, columns, kev, epss, advisories
     )
 
@@ -928,6 +970,15 @@ def main() -> None:
     for n, chunk in chunks.items():
         write_json(out / "details" / f"{n}.json", chunk)
 
+    reason_chunks: dict[int, dict] = {}
+    for row in rows:
+        if row["id"] in reasons:
+            reason_chunks.setdefault(row["c"], {})[row["id"]] = reasons[row["id"]]
+    for path in (out / "rationale").glob("*.json"):
+        path.unlink()
+    for n, chunk in reason_chunks.items():
+        write_json(out / "rationale" / f"{n}.json", chunk)
+
     write_json(out / "index.json", {"rows": rows})
 
     meta = {
@@ -938,6 +989,7 @@ def main() -> None:
         "kev_catalog": kev_version,
         "epss_scored": epss_date,
         "kev_count": sum(1 for r in rows if r.get("kev")),
+        "rationale_count": len(reasons),
         "advisory_count": sum(1 for r in rows if r.get("adv")),
         "chunk_size": DETAIL_CHUNK,
         "chunks": len(chunks),
@@ -965,7 +1017,8 @@ def main() -> None:
     log(f"wrote {len(rows)} CVEs, {len(chunks)} detail chunks in {time.time() - started:.1f}s")
     log(
         f"  triage: {meta['kev_count']} in CISA KEV, "
-        f"{meta['advisory_count']} covered by a DSA/DLA"
+        f"{meta['advisory_count']} covered by a DSA/DLA, "
+        f"{meta['rationale_count']} with a written CVSS justification"
     )
     for col in columns:
         tally = meta["counts"][col["id"]]
