@@ -1389,6 +1389,67 @@ class Exposure:
         return result
 
 
+def load_distro_notes(cache: Path) -> dict:
+    """Plain-language writeups other distributions publish, by CVE id.
+
+    scripts/distro_notes.py produces this; the build folds it in if it is
+    there and carries on without it if it is not, so neither script blocks
+    the other.
+
+    The republication gate is enforced HERE rather than in the page, so text
+    the project has no licence to redistribute never reaches site/data at
+    all.  Red Hat publishes under CC BY 4.0 and is quoted with attribution;
+    Ubuntu declares no republication grant, so only its link survives.
+    """
+    path = cache / "distro-notes.json"
+    if not path.exists():
+        log("no distro-notes.json, skipping distro prose")
+        return {}
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    sources = doc.get("sources", {})
+    quotable = {
+        name: meta.get("republish") == "permitted-with-attribution"
+        for name, meta in sources.items()
+    }
+
+    out: dict[str, dict] = {}
+    for cve, blocks in doc.get("notes", {}).items():
+        kept = {}
+        for name, block in blocks.items():
+            entry = {
+                "source": block.get("source", name),
+                "url": block.get("url"),
+                "date": block.get("date"),
+                "severity": block.get("severity"),
+            }
+            if quotable.get(name):
+                entry["fields"] = block.get("fields", [])
+                entry["quoted"] = True
+            else:
+                # Linked, not quoted: we may point at it, not reproduce it.
+                entry["quoted"] = False
+            kept[name] = entry
+        if kept:
+            out[cve] = kept
+
+    # Absent and silent mean different things and must stay distinguishable:
+    # "this source has no record of the CVE" is not "this source tracks it and
+    # wrote nothing", and neither is "we never looked".
+    state: dict[str, dict[str, str]] = {}
+    for name in sources:
+        for cve in doc.get("absent", {}).get(name, []):
+            state.setdefault(cve, {})[name] = "absent"
+        for cve in doc.get("silent", {}).get(name, []):
+            state.setdefault(cve, {})[name] = "silent"
+
+    log(
+        f"distro prose: {len(out)} CVEs of {len(doc.get('examined', []))} examined "
+        f"({', '.join(n for n, q in quotable.items() if q)} quotable)"
+    )
+    return {"notes": out, "state": state, "sources": sources,
+            "examined": set(doc.get("examined", []))}
+
+
 # --------------------------------------------------------------------------
 # version arithmetic
 # --------------------------------------------------------------------------
@@ -1507,6 +1568,7 @@ def assemble(
     epss: dict[str, tuple[float, float]],
     advisories: dict[str, list[dict]],
     exposure: Exposure | None,
+    prose: dict,
 ):
     all_cves = sorted({cve for pkg in packages.values() for cve in pkg})
     rows = []
@@ -1655,6 +1717,8 @@ def assemble(
             parts = dict(x.split(":", 1) for x in vector.split("/")[1:])
             row["av"] = parts.get("AV", "")
             row["pr"] = parts.get("PR", "")
+        if prose.get("notes", {}).get(cve):
+            row["nts"] = 1
         rows.append(row)
 
         if rec.get("cvss_reasons"):
@@ -1672,6 +1736,9 @@ def assemble(
             "maintainers": maint,
             "exposure": exp or None,
             "has_reasons": bool(rec.get("cvss_reasons")),
+            "notes": prose.get("notes", {}).get(cve),
+            "notes_state": prose.get("state", {}).get(cve),
+            "notes_examined": cve in prose.get("examined", ()),
             "kev": kev_entry,
             "advisories": advs,
             "pending": pending,
@@ -1847,8 +1914,9 @@ def main() -> None:
             configs[col["id"]].flavours if col["id"] in configs else []
         )
 
+    prose = load_distro_notes(args.cache)
     rows, details, reasons, subsystems, modules = assemble(
-        packages, kernel, dates, columns, kev, epss, advisories, exposure
+        packages, kernel, dates, columns, kev, epss, advisories, exposure, prose
     )
 
     built = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1887,6 +1955,8 @@ def main() -> None:
         "epss_scored": epss_date,
         "kev_count": sum(1 for r in rows if r.get("kev")),
         "rationale_count": len(reasons),
+        "prose_count": sum(1 for r in rows if r.get("nts")),
+        "prose_sources": prose.get("sources", {}),
         "advisory_count": sum(1 for r in rows if r.get("adv")),
         "chunk_size": DETAIL_CHUNK,
         "chunks": len(chunks),
@@ -1934,7 +2004,8 @@ def main() -> None:
     log(
         f"  triage: {meta['kev_count']} in CISA KEV, "
         f"{meta['advisory_count']} covered by a DSA/DLA, "
-        f"{meta['rationale_count']} with a written CVSS justification"
+        f"{meta['rationale_count']} with a written CVSS justification, "
+        f"{meta['prose_count']} with a distro writeup"
     )
     for col in columns:
         tally = meta["counts"][col["id"]]

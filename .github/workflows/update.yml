@@ -40,6 +40,26 @@ jobs:
           key: triage-${{ github.run_id }}
           restore-keys: triage-
 
+      # The distro writeups cost a 196 MB mirror and ~500 s of polite,
+      # rate-limited requests on a cold cache, so this one is worth carrying
+      # between runs.  A miss is survivable: the build logs it and continues.
+      - name: Cache distro writeups
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/redhat
+            .cache/redhat-listing.json
+            .cache/ubuntu-cve-tracker.git
+            .cache/distro-notes.json
+          key: distro-${{ github.run_id }}
+          restore-keys: distro-
+
+      # Third-party services, so a failure here must not fail the deploy.
+      # scripts/build.py carries on without the file.
+      - name: Collect distro writeups
+        continue-on-error: true
+        run: python3 scripts/distro_notes.py
+
       - name: Build site data
         run: python3 scripts/build.py --base-url "${{ steps.pages.outputs.base_url }}/"
 
