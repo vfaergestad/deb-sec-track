@@ -12,3 +12,6 @@ site/data/
 site/cve/
 site/sitemap.xml
 site/robots.txt
+
+# Python bytecode from running the build scripts.
+__pycache__/

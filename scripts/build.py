@@ -27,11 +27,15 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import io
 import json
+import lzma
 import math
 import re
+import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -566,6 +570,826 @@ def load_advisories(cache: Path, offline: bool) -> dict[str, list[dict]]:
 
 
 # --------------------------------------------------------------------------
+# kernel source exposure: subsystem, Kconfig symbol, Debian's config
+# --------------------------------------------------------------------------
+#
+# The CNA tells us which source files a CVE touches.  Three published data
+# sets turn that into something a sysadmin can act on:
+#
+#   MAINTAINERS  - the kernel's own file-pattern -> subsystem table, so the
+#                  bug gets the name people search for rather than a path.
+#   kbuild       - the Makefiles map an object file onto the CONFIG_ symbol
+#                  that decides whether it is compiled, and onto the .ko it
+#                  ends up in.
+#   debian/config- Debian publishes the exact .config it builds each flavour
+#                  with, so the symbol's value says whether *this* release
+#                  builds the vulnerable code at all.
+#
+# Every step is a lookup or a textual match in one of those files.  Nothing
+# is inferred: where a file has no Makefile entry, or a symbol no value, the
+# field is simply absent.
+
+# GitHub's mirror of linux-stable rather than git.kernel.org, because
+# kernel.org's server refuses partial clones ("filtering not recognized by
+# server") and a shallow clone there costs 286 MB and a minute *per tag*.
+# The mirror serves a blobless clone plus a Makefile-only sparse checkout in
+# about 3 s and 17 MB, which is what makes a tree per Debian release
+# affordable.  Tag objects were checked against kernel.org and match.
+LINUX_MIRROR = "https://github.com/gregkh/linux.git"
+
+# Fallback for the subsystem lookup alone, if no tree can be fetched.
+MAINTAINERS_URL = (
+    "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
+    "/plain/MAINTAINERS"
+)
+
+# Only Makefiles, Kbuild files and MAINTAINERS are checked out; the rest of
+# the tree is never fetched.
+TREE_SPARSE_PATTERNS = ("/Makefile", "**/Makefile", "**/Kbuild", "/MAINTAINERS")
+
+# Debian source packages live in the main archive until a release moves to
+# the security archive, so try both.  The file name is fully determined by
+# the source package and its version, which is why no index is downloaded.
+DEBIAN_POOLS = (
+    "https://deb.debian.org/debian/pool/main/l/{dir}/{file}",
+    "https://deb.debian.org/debian-security/pool/updates/main/l/{dir}/{file}",
+)
+
+# Config states, as reported per Debian release.  Debian builds one config
+# per architecture and flavour, so a single letter has to say both what the
+# affected code is and whether every flavour agrees.  Lower case means every
+# flavour this release builds does the same thing; upper case means the rest
+# of them do not build the code at all.  The full per-flavour answer is in
+# the detail chunk either way - this letter is a badge, not the evidence.
+CONFIG_CODES = {
+    "y": "built into the kernel image on every flavour - only a patch removes it",
+    "Y": "built in where it is built at all; some flavours do not build it",
+    "m": "a loadable module on every flavour - check lsmod, can be blacklisted",
+    "M": "a module where it is built at all; some flavours do not build it",
+    "b": "built in on some flavours, a module on others",
+    "B": "built in on some, a module on others, absent on the rest",
+    "n": "not enabled on any flavour - this release does not build the code",
+    "?": "not established - no Makefile entry for the affected file",
+}
+
+
+def try_download(url: str, path: Path, offline: bool, quiet: bool = False) -> Path | None:
+    """download(), but a missing or unreachable source is not fatal.
+
+    Everything in this section is enrichment: if it cannot be fetched the
+    build still has to produce a complete site, just without these fields.
+    `quiet` is for the probes where a 404 is the expected answer rather than
+    a problem - not every architecture gets every package.
+    """
+    if offline:
+        if path.exists():
+            return path
+        if not quiet:
+            log(f"warning: --offline and {path.name} is not cached, skipping")
+        return None
+    try:
+        if quiet:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "debian-kernel-cve-tracker/1.0"}
+            )
+            tmp = path.with_name(path.name + ".tmp")
+            with urllib.request.urlopen(req, timeout=300) as resp, tmp.open("wb") as fh:
+                while chunk := resp.read(1 << 20):
+                    fh.write(chunk)
+            tmp.replace(path)
+            return path
+        return download(url, path, offline)
+    except Exception as exc:  # noqa: BLE001 - any network/HTTP error is fine here
+        if not quiet:
+            log(f"warning: {url} unavailable ({exc})")
+        return None
+
+
+# --------------------------------------------------------------------------
+# MAINTAINERS
+# --------------------------------------------------------------------------
+
+MAINTAINERS_FIELD = re.compile(r"^([A-Z]):\t(.*)$")
+GLOB_CHARS = re.compile(r"[*?\[]")
+
+
+def _glob_to_re(pattern: str) -> re.Pattern:
+    """MAINTAINERS globs: '*' stops at a '/', a trailing '/' means a subtree."""
+    out = []
+    for ch in pattern:
+        if ch == "*":
+            out.append("[^/]*")
+        elif ch == "?":
+            out.append("[^/]")
+        else:
+            out.append(re.escape(ch))
+    body = "".join(out)
+    if pattern.endswith("/"):
+        return re.compile("^" + body + ".*$")
+    return re.compile("^" + body + "(/.*)?$")
+
+
+def _literal_prefix(pattern: str) -> str:
+    """The deepest directory of a pattern that contains no wildcard."""
+    parts = pattern.rstrip("/").split("/")
+    keep = []
+    for part in parts[:-1] if not pattern.endswith("/") else parts:
+        if GLOB_CHARS.search(part):
+            break
+        keep.append(part)
+    return "/".join(keep)
+
+
+class Maintainers:
+    """The kernel's own file -> subsystem table.
+
+    Matching follows what the file documents: an F: pattern claims a path, an
+    X: pattern in the same section takes it back, and where several sections
+    claim the same path the most specific pattern wins.  Patterns are bucketed
+    by their wildcard-free directory prefix so a lookup only compares against
+    the handful of patterns that could possibly match.
+    """
+
+    def __init__(self, text: str) -> None:
+        self.sections: list[dict] = []
+        self.buckets: dict[str, list[tuple]] = {}
+        self._cache: dict[str, dict | None] = {}
+        self._parse(text)
+
+    def _parse(self, text: str) -> None:
+        lines = text.split("\n")
+        current: dict | None = None
+        for n, line in enumerate(lines):
+            field = MAINTAINERS_FIELD.match(line)
+            if field and current is not None:
+                current.setdefault(field.group(1), []).append(field.group(2).strip())
+                continue
+            # A section header is a bare line immediately followed by fields.
+            if (
+                line.strip()
+                and not line.startswith((" ", "\t"))
+                and n + 1 < len(lines)
+                and MAINTAINERS_FIELD.match(lines[n + 1])
+            ):
+                current = {"name": line.strip()}
+                self.sections.append(current)
+            elif not line.strip():
+                current = None
+        for section in self.sections:
+            excludes = [_glob_to_re(x) for x in section.get("X", [])]
+            for pattern in section.get("F", []):
+                entry = (
+                    len(pattern),
+                    pattern.count("/"),
+                    pattern,
+                    _glob_to_re(pattern),
+                    excludes,
+                    section,
+                )
+                self.buckets.setdefault(_literal_prefix(pattern), []).append(entry)
+
+    def lookup(self, path: str) -> dict | None:
+        """The most specific section claiming `path`, or None."""
+        if path in self._cache:
+            return self._cache[path]
+        parts = path.split("/")
+        best = None
+        for depth in range(len(parts)):
+            prefix = "/".join(parts[:depth])
+            for entry in self.buckets.get(prefix, ()):
+                if not entry[3].match(path):
+                    continue
+                if any(x.match(path) for x in entry[4]):
+                    continue
+                if best is None or entry[:3] > best[:3]:
+                    best = entry
+        result = None
+        if best is not None:
+            section = best[5]
+            result = {
+                "name": section["name"],
+                "pattern": best[2],
+                "list": _mailing_list(section.get("L", [])),
+                "status": (section.get("S") or [""])[0],
+            }
+        self._cache[path] = result
+        return result
+
+
+def _mailing_list(entries: list[str]) -> str:
+    """The first L: address, without the '(moderated ...)' annotation."""
+    if not entries:
+        return ""
+    return entries[0].split(" (")[0].strip()
+
+
+# The catch-all section at the bottom of MAINTAINERS ("F: *").  It matches
+# every path, so it is a statement that no subsystem claims the file, not a
+# subsystem name worth showing anyone.
+MAINTAINERS_CATCHALL = "THE REST"
+
+
+# --------------------------------------------------------------------------
+# kbuild: source file -> CONFIG_ symbol -> module
+# --------------------------------------------------------------------------
+
+MAKE_CONTINUATION = re.compile(r"\\\n")
+MAKE_ASSIGN = re.compile(r"^\s*([A-Za-z0-9_$()\-./]+)\s*[:+?]?=\s*(.*)$")
+MAKE_CONFIG = re.compile(r"\$\(CONFIG_([A-Za-z0-9_]+)\)")
+MAKE_IFDEF = re.compile(r"^\s*(ifdef|ifndef)\s+CONFIG_([A-Za-z0-9_]+)")
+MAKE_IFEQ = re.compile(
+    r"^\s*ifeq\s*\(\s*\$\(CONFIG_([A-Za-z0-9_]+)\)\s*,\s*([ym])?\s*\)"
+)
+MAKE_STEM = re.compile(r"-(?:y|m|objs|objs-y|@)$")
+
+# Left-hand sides that add objects to the build directly rather than to a
+# composite module.  'lib-y' lands in lib.a, which is linked into vmlinux.
+KBUILD_OBJ_LHS = {"obj-@", "obj-y", "obj-m", "lib-y", "lib-m", "lib-@"}
+
+# Makefile variables that end in '-y' but are not composite objects.
+KBUILD_NOT_OBJECTS = {
+    "obj", "lib", "core", "drivers", "net", "libs", "always", "hostprogs",
+    "targets", "clean-files", "extra", "ccflags", "asflags", "cflags",
+    "subdir", "header-test", "quiet_cmd", "KBUILD_CFLAGS", "GCOV_PROFILE",
+}
+
+SOURCE_SUFFIXES = (".c", ".S", ".rs")
+
+
+class KbuildDir:
+    """What one directory's Makefile says about the objects in it."""
+
+    __slots__ = ("objects", "parts", "subdirs")
+
+    def __init__(self) -> None:
+        self.objects: dict[str, set] = {}   # object -> symbols guarding it
+        self.parts: dict[str, dict] = {}    # composite -> {member: symbols}
+        self.subdirs: dict[str, set] = {}   # subdirectory -> symbols
+
+
+def parse_makefile(text: str, into: KbuildDir) -> None:
+    """Record every 'obj-$(CONFIG_X) += foo.o' style rule in one Makefile.
+
+    This is a textual read, not an evaluation: make variables other than
+    CONFIG_ ones are ignored, and an `else` branch drops its guard rather
+    than pretending the negation can be expressed.  The result is therefore
+    conservative - it can miss a guard, never invent one.
+    """
+    text = MAKE_CONTINUATION.sub(" ", text)
+    guards: list[set] = []
+    for raw in text.split("\n"):
+        line = raw.split("#", 1)[0]
+        stripped = line.strip()
+        if not stripped:
+            continue
+        cond = MAKE_IFDEF.match(line)
+        if cond:
+            guards.append({cond.group(2)} if cond.group(1) == "ifdef" else set())
+            continue
+        cond = MAKE_IFEQ.match(line)
+        if cond:
+            guards.append({cond.group(1)} if cond.group(2) else set())
+            continue
+        if stripped.startswith(("ifeq", "ifneq", "ifdef", "ifndef")):
+            guards.append(set())
+            continue
+        if stripped.startswith("else"):
+            if guards:
+                guards[-1] = set()
+            continue
+        if stripped.startswith("endif"):
+            if guards:
+                guards.pop()
+            continue
+        assign = MAKE_ASSIGN.match(line)
+        if not assign:
+            continue
+        lhs, rhs = assign.group(1), assign.group(2)
+        tokens = [t for t in rhs.split() if not t.startswith("$(")]
+        objects = [t[:-2] for t in tokens if t.endswith(".o")]
+        subdirs = [t[:-1] for t in tokens if t.endswith("/")]
+        if not objects and not subdirs:
+            continue
+        symbols = set(MAKE_CONFIG.findall(lhs))
+        for guard in guards:
+            symbols |= guard
+        normalised = MAKE_CONFIG.sub("@", lhs)
+        if normalised in KBUILD_OBJ_LHS:
+            target = into.objects
+        else:
+            stem = MAKE_STEM.sub("", normalised)
+            if stem == normalised or stem in KBUILD_NOT_OBJECTS or not stem:
+                continue
+            target = into.parts.setdefault(stem, {})
+        for obj in objects:
+            target.setdefault(obj, set()).update(symbols)
+        for sub in subdirs:
+            into.subdirs.setdefault(sub, set()).update(symbols)
+
+
+class KernelTree:
+    """One kernel version's Makefiles, plus its MAINTAINERS.
+
+    Makefiles are parsed on first use rather than up front: a build only ever
+    asks about the ~1,800 directories the CNA's file lists mention, out of
+    the ~3,300 in the tree.
+    """
+
+    def __init__(self, root: Path, tag: str) -> None:
+        self.tag = tag
+        self.root = root
+        self.dirs: dict[str, KbuildDir | None] = {}
+        self._cache: dict[str, tuple | None] = {}
+        # Built on demand: compiling the ~10,000 F: patterns takes ~3 s and
+        # only one tree's table is ever used.
+        self.maintainers_file = root / "MAINTAINERS"
+        self._maintainers: Maintainers | None = None
+
+    def maintainers(self) -> Maintainers | None:
+        if self._maintainers is None and self.maintainers_file.exists():
+            self._maintainers = Maintainers(
+                self.maintainers_file.read_text(errors="replace")
+            )
+        return self._maintainers
+
+    def _dir(self, rel: str) -> KbuildDir | None:
+        if rel in self.dirs:
+            return self.dirs[rel]
+        entry = None
+        for name in ("Makefile", "Kbuild"):
+            path = self.root / rel / name if rel else self.root / name
+            if not path.is_file():
+                continue
+            entry = entry or KbuildDir()
+            try:
+                parse_makefile(path.read_text(errors="replace"), entry)
+            except OSError:
+                pass
+        self.dirs[rel] = entry
+        return entry
+
+    def resolve(self, path: str) -> tuple[list[str], str | None] | None:
+        """Source file -> (CONFIG_ symbols that must all be on, module base).
+
+        The symbols are every guard between the object and the top of the
+        tree: the one on its own obj- line, any on the composite module it is
+        linked into, and any on the directories above it.  The file is built
+        only if all of them are on, which is what makes the list the right
+        thing to look up in a .config.
+
+        Returns None when the file has no Makefile entry at all - a header, a
+        source file #included by another, or a path that does not exist in
+        this kernel version.  That is an absent answer, not a negative one.
+        """
+        if path in self._cache:
+            return self._cache[path]
+        self._cache[path] = result = self._resolve(path)
+        return result
+
+    def _resolve(self, path: str) -> tuple[list[str], str | None] | None:
+        if "/" not in path:
+            return None
+        dirname, filename = path.rsplit("/", 1)
+        stem = None
+        for suffix in SOURCE_SUFFIXES:
+            if filename.endswith(suffix):
+                stem = filename[: -len(suffix)]
+                break
+        if stem is None:
+            return None
+        entry = self._dir(dirname)
+        if entry is None:
+            return None
+
+        symbols: set = set()
+        module = None
+        current = stem
+        seen = set()
+        while True:
+            if current in seen:
+                return None  # a cycle: refuse to guess
+            seen.add(current)
+            if current in entry.objects:
+                symbols |= entry.objects[current]
+                module = current
+                break
+            for composite, members in entry.parts.items():
+                if current in members:
+                    symbols |= members[current]
+                    current = composite
+                    break
+            else:
+                return None
+
+        # Descending into a directory is itself conditional; walk up to the
+        # top-level directory, which the root Makefile always builds.
+        parts = dirname.split("/")
+        for depth in range(len(parts), 1, -1):
+            parent = self._dir("/".join(parts[: depth - 1]))
+            if parent:
+                symbols |= parent.subdirs.get(parts[depth - 1], set())
+        return sorted(symbols), module
+
+
+def sync_kernel_tree(cache: Path, tag: str, offline: bool) -> Path | None:
+    """Check out just the Makefiles of one kernel tag, or reuse the cache.
+
+    A tag is immutable, so a cached tree is never refreshed.  `.git` is
+    dropped afterwards: it holds a second copy of every blob and nothing here
+    ever needs git again.
+    """
+    dest = cache / "trees" / tag
+    if (dest / "MAINTAINERS").exists():
+        log(f"kernel tree {tag}: cached")
+        return dest
+    if offline:
+        log(f"warning: --offline and kernel tree {tag} is not cached, skipping")
+        return None
+    log(f"fetching Makefiles for {tag}")
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            [
+                "git", "clone", "--quiet", "--filter=blob:none", "--depth", "1",
+                "--no-checkout", "--branch", tag, LINUX_MIRROR, str(dest),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(dest), "sparse-checkout", "set", "--no-cone",
+             *TREE_SPARSE_PATTERNS],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(dest), "checkout", "--quiet"],
+            check=True,
+            capture_output=True,
+        )
+    except (subprocess.CalledProcessError, OSError) as exc:
+        log(f"warning: could not fetch kernel tree {tag} ({exc})")
+        shutil.rmtree(dest, ignore_errors=True)
+        return None
+    shutil.rmtree(dest / ".git", ignore_errors=True)
+    size = sum(f.stat().st_size for f in dest.rglob("*") if f.is_file())
+    log(f"  {tag}: {size / 1e6:.1f} MB of Makefiles")
+    return dest
+
+
+# --------------------------------------------------------------------------
+# Debian's published kernel configuration
+# --------------------------------------------------------------------------
+
+KCONFIG_SET = re.compile(r"^(CONFIG_[A-Za-z0-9_]+)=(.*)$")
+KCONFIG_UNSET = re.compile(r"^# (CONFIG_[A-Za-z0-9_]+) is not set$")
+RULES_GEN_ARCH = re.compile(r"\bARCH='([a-z0-9]+)'")
+CONFIG_MEMBER = re.compile(r"/config\.([a-z0-9]+)_([a-z0-9-]+)_([a-z0-9._-]+)\.xz$")
+
+
+def _pool_urls(source: str, filename: str) -> tuple[str, ...]:
+    return tuple(t.format(dir=source, file=filename) for t in DEBIAN_POOLS)
+
+
+def _epochless(version: str) -> str:
+    # Debian file names carry the version without its epoch.
+    return version.split(":", 1)[-1]
+
+
+def fetch_debian_packaging(
+    cache: Path, source: str, version: str, offline: bool
+) -> Path | None:
+    """The debian/ directory of one kernel source package, as shipped.
+
+    Only used for the list of architectures the release is built for; the
+    configuration itself comes from the binary packages below, because
+    debian/config/ holds *fragments* - it records what Debian overrides, not
+    the config that comes out the other end of `make olddefconfig`.
+    """
+    name = f"{source}_{_epochless(version)}.debian.tar.xz"
+    return _cached_fetch(cache / "debian-config", name, _pool_urls(source, name), offline)
+
+
+def _cached_fetch(
+    directory: Path, name: str, urls: tuple[str, ...], offline: bool,
+    quiet: bool = False,
+) -> Path | None:
+    """Fetch the first of `urls` that exists, or reuse what is cached.
+
+    A source package moves from the main archive to the security archive when
+    its release stops being stable, so both pools are tried.  Archive files
+    are immutable once published, so a cached copy is never re-fetched.
+    """
+    path = directory / name
+    if path.exists():
+        return path
+    if offline:
+        log(f"warning: --offline and {name} is not cached, skipping")
+        return None
+    directory.mkdir(parents=True, exist_ok=True)
+    for url in urls:
+        got = try_download(url, path, offline, quiet)
+        if got:
+            return got
+    return None
+
+
+def _ar_members(data: bytes):
+    """Walk a Unix `ar` archive, which is all a .deb is on the outside."""
+    if not data.startswith(b"!<arch>\n"):
+        raise ValueError("not an ar archive")
+    offset = 8
+    while offset + 60 <= len(data):
+        header = data[offset : offset + 60]
+        name = header[:16].decode("ascii", "replace").strip().rstrip("/")
+        try:
+            size = int(header[48:58].decode("ascii", "replace").strip())
+        except ValueError:
+            return
+        offset += 60
+        yield name, data[offset : offset + size]
+        offset += size + (size % 2)
+
+
+class DebianConfig:
+    """Every kernel configuration one Debian release actually builds with.
+
+    Source: the `linux-config-<series>` binary packages, one per
+    architecture, which exist precisely so that people can rebuild a Debian
+    kernel with Debian's configuration.  Each carries the final, expanded
+    .config for every flavour of that architecture - the same file that ends
+    up as /boot/config-* on an installed system.
+    """
+
+    def __init__(self) -> None:
+        self.flavours: list[str] = []
+        self.values: dict[str, dict[str, str]] = {}
+
+    def add_package(self, deb: Path) -> int:
+        """Read one architecture's .deb; returns the flavours it added."""
+        data = deb.read_bytes()
+        added = 0
+        for name, body in _ar_members(data):
+            if not name.startswith("data.tar"):
+                continue
+            with tarfile.open(fileobj=io.BytesIO(body)) as tar:
+                for member in tar.getmembers():
+                    matched = CONFIG_MEMBER.search(member.name)
+                    if not member.isfile() or not matched:
+                        continue
+                    arch, featureset, flavour = matched.groups()
+                    key = (
+                        f"{arch}/{flavour}"
+                        if featureset == "none"
+                        else f"{arch}/{featureset}/{flavour}"
+                    )
+                    if key in self.values:
+                        continue
+                    text = lzma.decompress(
+                        tar.extractfile(member).read()
+                    ).decode("utf-8", "replace")
+                    self.values[key] = _parse_kconfig(text)
+                    self.flavours.append(key)
+                    added += 1
+        self.flavours.sort()
+        return added
+
+    def state(self, symbols: list[str], flavour: str) -> str:
+        """'y', 'm' or 'n' for a set of symbols that must all be enabled.
+
+        A symbol missing from a finished .config is one whose dependencies
+        were not met, so it is off - which is why an absent symbol is 'n'
+        here but would have meant nothing in a config fragment.
+        """
+        values = self.values[flavour]
+        result = "y"
+        for symbol in symbols:
+            value = values.get("CONFIG_" + symbol, "n")
+            if value == "n":
+                return "n"
+            if value == "m":
+                result = "m"
+        return result
+
+
+def load_debian_config(
+    cache: Path, source: str, version: str, offline: bool
+) -> DebianConfig | None:
+    """All of one release's configs, one binary package per architecture."""
+    packaging = fetch_debian_packaging(cache, source, version, offline)
+    if packaging is None:
+        return None
+    try:
+        with tarfile.open(packaging) as tar:
+            member = tar.getmember("debian/rules.gen")
+            rules = tar.extractfile(member).read().decode("utf-8", "replace")
+    except (KeyError, tarfile.TarError, OSError) as exc:
+        log(f"warning: unreadable packaging for {source} {version} ({exc})")
+        return None
+    arches = sorted(set(RULES_GEN_ARCH.findall(rules)))
+    # The configuration package is named after the kernel series, not the
+    # source package: linux-6.12 6.12.107-1~deb12u1 ships linux-config-6.12.
+    base = upstream_version(version) or ""
+    series = ".".join(base.split(".")[:2])
+    if not series:
+        return None
+
+    # Not every architecture the source builds for is a release architecture,
+    # so a 404 here is the archive saying "no such port", not a failure.
+    config = DebianConfig()
+    for arch in arches:
+        name = f"linux-config-{series}_{_epochless(version)}_{arch}.deb"
+        deb = _cached_fetch(
+            cache / "debian-config", name, _pool_urls(source, name), offline,
+            quiet=True,
+        )
+        if deb is None:
+            continue
+        try:
+            config.add_package(deb)
+        except (ValueError, tarfile.TarError, lzma.LZMAError, OSError) as exc:
+            log(f"warning: unreadable {name} ({exc})")
+    return config if config.flavours else None
+
+
+def _parse_kconfig(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in text.split("\n"):
+        set_ = KCONFIG_SET.match(line)
+        if set_:
+            value = set_.group(2)
+            # Only tristates matter here; a string or number means "enabled".
+            out[set_.group(1)] = value if value in ("y", "m") else "y"
+            continue
+        unset = KCONFIG_UNSET.match(line)
+        if unset:
+            out[unset.group(1)] = "n"
+    return out
+
+
+def load_exposure_sources(
+    cache: Path, columns: list[dict], offline: bool
+) -> tuple[dict[str, KernelTree], dict[str, DebianConfig], Maintainers | None]:
+    """One kernel tree per distinct upstream version, one config per column."""
+    trees: dict[str, KernelTree] = {}
+    for tag in sorted({_tree_tag(col) for col in columns} - {None}):
+        root = sync_kernel_tree(cache, tag, offline)
+        if root is None:
+            continue
+        trees[tag] = KernelTree(root, tag)
+
+    configs: dict[str, DebianConfig] = {}
+    for col in columns:
+        if not col.get("version"):
+            continue
+        config = load_debian_config(cache, col["package"], col["version"], offline)
+        if config is None:
+            log(f"warning: no published configuration for {col['id']}")
+            continue
+        configs[col["id"]] = config
+        log(
+            f"  {col['id']}: {len(config.flavours)} flavours, "
+            f"{len(config.values[config.flavours[0]])} symbols in "
+            f"{config.flavours[0]}"
+        )
+
+    # The subsystem table is the same job in every tree; use the newest one
+    # that came back, and only reach for the network if none did.
+    maintainers = None
+    for tag in sorted(trees, key=lambda t: version_key(t.lstrip("v")), reverse=True):
+        if trees[tag].maintainers_file.exists():
+            maintainers = trees[tag].maintainers()
+            log(f"MAINTAINERS: from {tag}, {len(maintainers.sections)} sections")
+            break
+    if maintainers is None:
+        path = try_download(MAINTAINERS_URL, cache / "MAINTAINERS", offline)
+        if path:
+            maintainers = Maintainers(path.read_text(errors="replace"))
+            log(f"MAINTAINERS: from kernel.org, {len(maintainers.sections)} sections")
+    return trees, configs, maintainers
+
+
+def _tree_tag(col: dict) -> str | None:
+    """The upstream git tag matching the kernel version a column ships."""
+    base = upstream_version(col.get("version", ""))
+    return f"v{base}" if base else None
+
+
+class Exposure:
+    """Per-CVE answers to 'what is it called, and does my release build it?'"""
+
+    def __init__(
+        self,
+        columns: list[dict],
+        trees: dict[str, KernelTree],
+        configs: dict[str, DebianConfig],
+        maintainers: Maintainers | None,
+    ) -> None:
+        self.columns = columns
+        self.trees = trees
+        self.configs = configs
+        self.maintainers = maintainers
+        self._states: dict[tuple, tuple[str, dict]] = {}
+
+    def subsystem(self, files: list[str]) -> dict | None:
+        """The MAINTAINERS section for the first file that a subsystem claims."""
+        if not self.maintainers:
+            return None
+        fallback = None
+        for path in files:
+            hit = self.maintainers.lookup(path)
+            if hit is None:
+                continue
+            if hit["name"] != MAINTAINERS_CATCHALL:
+                return hit
+            fallback = fallback or hit
+        return fallback
+
+    def build(self, files: list[str]) -> dict:
+        """Everything derivable about one CVE's files.
+
+        Each release is resolved against its own kernel tree and its own
+        published config, so the answer for Debian 12 comes from 6.1's
+        Makefiles and 6.1's .config, not from whatever the newest kernel
+        happens to do.  A release is left out when its tree has no Makefile
+        entry for the file - "we do not know" has to stay distinguishable
+        from "not enabled".
+
+        The symbols and the module are almost always the same in every
+        release, so they are hoisted out of the per-release map and only the
+        exceptions are repeated under "by".
+        """
+        columns: dict[str, dict] = {}
+        for col in self.columns:
+            tree = self.trees.get(_tree_tag(col) or "")
+            if tree is None:
+                continue
+            resolved = None
+            for path in files:
+                resolved = tree.resolve(path)
+                if resolved is not None:
+                    break
+            if resolved is None:
+                continue
+            symbols, module = resolved
+            entry: dict = {"sym": symbols, "mod": module or ""}
+            config = self.configs.get(col["id"])
+            if config is not None:
+                summary, per_flavour = self._config_state(col["id"], config, symbols)
+                entry["state"] = summary
+                # One letter per flavour, in the order meta.json lists them
+                # for this column.  Only stored where the flavours disagree:
+                # where they agree the summary letter already says it.
+                if len(set(per_flavour)) > 1:
+                    entry["flav"] = per_flavour
+            columns[col["id"]] = entry
+        if not columns:
+            return {}
+
+        shapes = {(tuple(e["sym"]), e["mod"]) for e in columns.values()}
+        common = next(iter(shapes)) if len(shapes) == 1 else None
+        out: dict = {
+            "state": {c: e["state"] for c, e in columns.items() if "state" in e},
+            "flav": {c: e["flav"] for c, e in columns.items() if "flav" in e},
+        }
+        out = {k: v for k, v in out.items() if v}
+        if common is not None:
+            # Kept even when empty: an empty symbol list means the file is
+            # compiled unconditionally, which is an answer, not a gap.
+            out["sym"] = list(common[0])
+            out["mod"] = common[1]
+        else:
+            out["by"] = {
+                c: {"sym": e["sym"], "mod": e["mod"]} for c, e in columns.items()
+            }
+        return out
+
+    def _config_state(
+        self, col_id: str, config: DebianConfig, symbols: list[str]
+    ) -> tuple[str, str]:
+        """(summary letter, one letter per flavour of this release)."""
+        key = (col_id, tuple(symbols))
+        cached = self._states.get(key)
+        if cached is not None:
+            return cached
+        per_flavour = "".join(
+            config.state(symbols, flavour) for flavour in config.flavours
+        )
+        built = set(per_flavour) - {"n"}
+        if not built:
+            summary = "n"
+        else:
+            summary = built.pop() if len(built) == 1 else "b"
+            # Upper case where some flavours do not build the code at all,
+            # which is usually an architecture that has no such hardware.
+            if "n" in per_flavour:
+                summary = summary.upper()
+        self._states[key] = result = (summary, per_flavour)
+        return result
+
+
+# --------------------------------------------------------------------------
 # version arithmetic
 # --------------------------------------------------------------------------
 
@@ -682,10 +1506,25 @@ def assemble(
     kev: dict[str, dict],
     epss: dict[str, tuple[float, float]],
     advisories: dict[str, list[dict]],
+    exposure: Exposure | None,
 ):
     all_cves = sorted({cve for pkg in packages.values() for cve in pkg})
     rows = []
     details: dict[str, dict] = {}
+    # Subsystem names and module names repeat across thousands of CVEs, so
+    # index.json stores an offset into a table in meta.json instead of the
+    # string.  That is the difference between ~40 bytes and ~4 per row.
+    subsystems: list[list[str]] = []
+    subsystem_index: dict[str, int] = {}
+    modules: list[str] = []
+    module_index: dict[str, int] = {}
+    # Newest kernel first: where columns disagree about the module name the
+    # newest tree is the one that matches the code as it stands today.
+    by_kernel = sorted(
+        columns,
+        key=lambda c: version_key(upstream_version(c.get("version", "")) or "0"),
+        reverse=True,
+    )
     # Kept out of the detail chunks: the justification text is ~2 KB per CVE
     # and most readers never open it, so it is served from its own files and
     # fetched only when someone actually asks why a score is what it is.
@@ -745,12 +1584,44 @@ def assemble(
         deb = packages["linux"].get(cve) or packages.get("linux-6.12", {}).get(cve, {})
         summary = rec.get("title") or first_sentence(deb.get("description", "")) or cve
 
+        files = rec.get("files", [])
+        exp = exposure.build(files) if exposure and files else {}
+        maint = exposure.subsystem(files) if exposure and files else None
+        states = exp.get("state", {})
+        # One character per column, in the same order as "st": what this
+        # release's own kernel configuration does with the affected code.
+        config_states = "".join(states.get(col["id"], "?") for col in columns)
+        # The name to type into lsmod, but only where some flavour really
+        # does build it as a module.  Newest kernel first, because that is
+        # the tree whose file layout matches the code as it stands now.
+        module_name = ""
+        if any(c in "mMbB" for c in config_states):
+            for col in by_kernel:
+                per_col = exp.get("by", {}).get(col["id"])
+                name = per_col["mod"] if per_col else exp.get("mod", "")
+                if name and col["id"] in states:
+                    module_name = name
+                    break
+
         published = dates.get(cve)
         row = {
             "id": cve,
             "sum": summary,
             "st": "".join(codes),
         }
+        if maint and maint["name"] != MAINTAINERS_CATCHALL:
+            key = maint["name"]
+            if key not in subsystem_index:
+                subsystem_index[key] = len(subsystems)
+                subsystems.append([key, maint["list"], maint["status"]])
+            row["sub"] = subsystem_index[key]
+        if set(config_states) != {"?"}:
+            row["cfg"] = config_states
+        if module_name:
+            if module_name not in module_index:
+                module_index[module_name] = len(modules)
+                modules.append(module_name)
+            row["mod"] = module_index[module_name]
         if published:
             row["pub"] = published
         if score is not None:
@@ -798,6 +1669,8 @@ def assemble(
             "debianbug": deb.get("debianbug"),
             "scope": deb.get("scope"),
             "subsystem": subsystem,
+            "maintainers": maint,
+            "exposure": exp or None,
             "has_reasons": bool(rec.get("cvss_reasons")),
             "kev": kev_entry,
             "advisories": advs,
@@ -811,7 +1684,14 @@ def assemble(
     for n, row in enumerate(rows):
         row["c"] = n // DETAIL_CHUNK
 
-    return rows, details, reasons
+    return rows, details, reasons, subsystems, modules
+
+
+def _has_symbol(exposure: dict) -> bool:
+    """Did any release map the affected file onto a CONFIG_ symbol?"""
+    if exposure.get("sym"):
+        return True
+    return any(entry.get("sym") for entry in exposure.get("by", {}).values())
 
 
 def first_sentence(text: str, limit: int = 160) -> str:
@@ -953,8 +1833,22 @@ def main() -> None:
     for col in columns:
         col["version"] = versions.get(col["id"], "")
 
-    rows, details, reasons = assemble(
-        packages, kernel, dates, columns, kev, epss, advisories
+    trees, configs, maintainers = load_exposure_sources(
+        args.cache, columns, args.offline
+    )
+    exposure = (
+        Exposure(columns, trees, configs, maintainers)
+        if (trees or maintainers)
+        else None
+    )
+    for col in columns:
+        col["kernel_tree"] = _tree_tag(col) if _tree_tag(col) in trees else ""
+        col["config_flavours"] = (
+            configs[col["id"]].flavours if col["id"] in configs else []
+        )
+
+    rows, details, reasons, subsystems, modules = assemble(
+        packages, kernel, dates, columns, kev, epss, advisories, exposure
     )
 
     built = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -987,6 +1881,9 @@ def main() -> None:
         "status_codes": STATUS_CODES,
         "pending_codes": PENDING_CODES,
         "kev_catalog": kev_version,
+        "subsystems": subsystems,
+        "modules": modules,
+        "config_codes": CONFIG_CODES,
         "epss_scored": epss_date,
         "kev_count": sum(1 for r in rows if r.get("kev")),
         "rationale_count": len(reasons),
@@ -1002,6 +1899,9 @@ def main() -> None:
             "kev": KEV_URL,
             "epss": EPSS_URL,
             "advisories": ADVISORY_URLS["DSA"],
+            "maintainers": MAINTAINERS_URL,
+            "kernel_tree": LINUX_MIRROR,
+            "debian_config": "https://deb.debian.org/debian/pool/main/l/linux/",
         },
         "packages": list(packages),
     }
@@ -1015,6 +1915,22 @@ def main() -> None:
         (out / "feeds" / f"{col['id']}.xml").write_text(feed, encoding="utf-8")
 
     log(f"wrote {len(rows)} CVEs, {len(chunks)} detail chunks in {time.time() - started:.1f}s")
+    with_subsystem = sum(1 for r in rows if "sub" in r)
+    with_symbol = sum(
+        1
+        for r in rows
+        if _has_symbol(details[r["id"]].get("exposure") or {})
+    )
+    with_state = sum(1 for r in rows if "cfg" in r and set(r["cfg"]) != {"?"})
+    not_built = sum(1 for r in rows if "n" in r.get("cfg", ""))
+    with_module = sum(1 for r in rows if "mod" in r)
+    log(
+        f"  exposure: {with_subsystem} with a subsystem name "
+        f"({len(subsystems)} distinct), {with_symbol} with a Kconfig symbol, "
+        f"{with_state} with a per-release config state, "
+        f"{with_module} with a module name ({len(modules)} distinct); "
+        f"{not_built} not built in at least one release"
+    )
     log(
         f"  triage: {meta['kev_count']} in CISA KEV, "
         f"{meta['advisory_count']} covered by a DSA/DLA, "
