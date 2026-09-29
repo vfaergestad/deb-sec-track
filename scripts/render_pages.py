@@ -53,7 +53,16 @@ UNRESOLVED_CODES = "VIU"
 # rest is citation markup.  The inclusion rule below is what keeps that
 # bounded: the recent window is a fixed 120 days and the KEV set is tiny, so
 # the only part that grows with time is the unresolved set.
-MAX_TOTAL_BYTES = 80 * 1024 * 1024
+#
+# Raised again from 80 MB when the exposure answer and the other distributions'
+# write-ups were added.  Measured on the 2026-09-28 data: 6,017 pages, 95.1 MB
+# in total, against 73.5 MB for the same 6,017 pages without the two new
+# sections.  Of the 21.6 MB added, 15.6 MB is the exposure panel
+# (2.7 KB a page, present on every page) and 6.0 MB the write-ups.
+# That leaves under 5 MB of headroom, which is roughly 300 more pages: the
+# next thing that grows this tree needs either a tighter inclusion rule above
+# or a decision to raise this again.
+MAX_TOTAL_BYTES = 100 * 1024 * 1024
 
 # Used for <link rel="canonical"> and the sitemap when --base-url is not given.
 # GitHub Pages for git@github.com:vfaergestad/deb-sec-track.git.
@@ -435,6 +444,405 @@ def reasons_block(row, detail, reasons, meta):
                    "Reasoning source: the kernel CNA scoring file"), "".join(items)))
 
 
+# ------------------------------------------ exposure, and the checks
+# Ports of the functions of the same name in site/app.js.  The wording is the
+# same on a static page as in the app, for the same CVE.
+
+def cfg_word(letter, meta):
+    """The legend meta.json publishes for a build-state letter.  Read out of
+    the data rather than written here, so the page and the file it renders
+    cannot disagree about what a letter means.  The case carries meaning:
+    lower case means every kernel flavour Debian builds for that release
+    agrees, upper case means the flavours disagree.  Nothing here folds the
+    two together, and `?` ("not established") is never treated as `n`."""
+    return (meta.get("config_codes") or {}).get(letter) or "not established"
+
+
+def cfg_tone(letter):
+    """Tone only: which of the four shapes a single letter belongs to, used
+    for the chip colour and for nothing else."""
+    if letter == "n":
+        return "none"
+    if letter == "?" or not letter:
+        return "unknown"
+    return "all" if letter == letter.lower() else "some"
+
+
+def exposure_shape(row, meta):
+    """Which releases this CVE applies to, what letter the build reported for
+    each, and which shape the row as a whole is in.  The shape is a count of
+    letters, not a judgement.  "none" is deliberately the strictest of the
+    four: every release this CVE applies to has to say `n`, so one release
+    whose build rule could not be established is enough to make it "partial"
+    instead.  A `?` never helps a row qualify as not built."""
+    seen = []
+    cfg = row.get("cfg") or ""
+    for i, col in enumerate(meta["columns"]):
+        if row["st"][i] == "-":
+            continue
+        letter = cfg[i] if i < len(cfg) else "?"
+        seen.append({"col": col, "i": i, "letter": letter or "?"})
+    known = [s for s in seen if s["letter"] != "?"]
+    none = [s for s in known if s["letter"] == "n"]
+    if not known:
+        shape = "unknown"
+    elif len(none) == len(seen):
+        shape = "none"
+    elif none:
+        shape = "partial"
+    else:
+        shape = "built"
+    return {"seen": seen, "known": known, "none": none, "shape": shape,
+            "unresolved": len(seen) - len(known)}
+
+
+def rel_count(n):
+    return "%d release%s" % (n, "" if n == 1 else "s")
+
+
+def exposure_lead(sh):
+    """The one sentence at the top of the panel.  Every clause in it is read
+    off the letters above; where a release could not be established it says so
+    rather than counting it either way."""
+    gap = ""
+    if sh["unresolved"]:
+        gap = (" The build rule could not be established for %s, so nothing is "
+               "claimed about those." % rel_count(sh["unresolved"]))
+    if sh["shape"] == "unknown":
+        return ("<b>Not established.</b> This site could not find the build rule "
+                "for the affected file in the kernel trees Debian ships, so it "
+                "has no answer about whether Debian compiles this code. Read "
+                "that as unknown, never as absent.")
+    if sh["shape"] == "none":
+        return ("<b>Debian does not build this code.</b> In %s below, every "
+                "kernel flavour Debian publishes has the switch off, so the "
+                "vulnerable file is compiled into no kernel binary Debian "
+                "ships.%s" % (rel_count(len(sh["none"])), gap))
+    if sh["shape"] == "partial":
+        rest = len(sh["known"]) - len(sh["none"])
+        return ("<b>Debian does not build this code in %s.</b>%s%s"
+                % (rel_count(len(sh["none"])),
+                   (" It does build it in %s, so the answer depends on which "
+                    "release the machine runs." % rel_count(rest)) if rest else "",
+                   gap))
+    if any(s["letter"] != s["letter"].lower() for s in sh["known"]):
+        return ("<b>Debian builds this, but not on every flavour.</b> At least "
+                "one release below builds the code on some of its kernel "
+                "flavours and not on others, so the answer depends on the "
+                "architecture and flavour installed.%s" % gap)
+    # With a release unaccounted for, "every release below" would be a claim
+    # about a release this lookup has no answer for.
+    every = ("Every release with an answer below" if sh["unresolved"]
+             else "Every release below")
+    if all(s["letter"] == "m" for s in sh["known"]):
+        return ("<b>Debian builds this as a loadable module.</b> %s compiles it "
+                "as a module on every flavour, so whether the code is in the "
+                "running kernel depends on whether that module is loaded.%s"
+                % (every, gap))
+    return ("<b>Debian builds this code.</b> %s compiles the affected file into "
+            "the kernels it ships.%s" % (every, gap))
+
+
+def off_flavours(col, flav):
+    """The flavours of one release that do not build the code at all.  The
+    string is one letter per flavour, in the order meta.json lists them for
+    that column, and is present only where that release's flavours disagree."""
+    string = (flav or {}).get(col["id"]) or ""
+    names = col.get("config_flavours") or []
+    return [names[k] for k in range(min(len(string), len(names)))
+            if string[k] == "n"]
+
+
+def exposure_releases(detail, meta, sh):
+    """One line per answer, not per release: releases that agree are named
+    together, because five copies of one sentence is not five pieces of
+    information.  The legend for each letter used is printed once underneath,
+    so the meaning is on the page without being repeated per row."""
+    flav = ((detail.get("exposure") or {}).get("flav")) or {}
+    groups = []
+    for s in sh["seen"]:
+        off = off_flavours(s["col"], flav)
+        key = (s["letter"], tuple(off))
+        if groups and groups[-1]["key"] == key:
+            groups[-1]["names"].append(s["col"]["label"])
+        else:
+            groups.append({"key": key, "letter": s["letter"], "off": off,
+                           "names": [s["col"]["label"]]})
+    rows = []
+    for g in groups:
+        rows.append(
+            '<li class="cfg-row"><span class="cfg-rel">%s</span>'
+            '<span class="cfg-chip t-%s">%s</span>%s</li>'
+            % (esc(", ".join(g["names"])), cfg_tone(g["letter"]),
+               esc(g["letter"]),
+               ('<span class="cfg-word">not built on %s</span>'
+                % esc(", ".join(g["off"]))) if g["off"] else ""))
+    letters = []
+    for g in groups:
+        if g["letter"] not in letters:
+            letters.append(g["letter"])
+    key = "".join('<dt><span class="cfg-chip t-%s">%s</span></dt><dd>%s</dd>'
+                  % (cfg_tone(l), esc(l), esc(cfg_word(l, meta)))
+                  for l in letters)
+    return ('<ul class="cfg-list">%s</ul><dl class="cfg-key">%s</dl>'
+            % ("".join(rows), key))
+
+
+def exposure_symbols(detail):
+    """Every Kconfig symbol that has to be on for the file to be compiled,
+    taken over all releases.  Where the releases resolved to different symbol
+    lists the union is what a reader should grep for, because they are looking
+    at one machine and do not yet know which list applies to it."""
+    e = detail.get("exposure") or {}
+    out = set(e.get("sym") or [])
+    for entry in (e.get("by") or {}).values():
+        out.update(entry.get("sym") or [])
+    return sorted(out)
+
+
+def config_command(syms):
+    """The command a reader would actually type.  Generic and standard: one
+    grep of the booted kernel's own configuration.  Nothing here knows
+    anything about the machine, and nothing is invented: `-w` is what keeps
+    CONFIG_BRIDGE from matching CONFIG_BRIDGE_CFM."""
+    if not syms:
+        return ""
+    if len(syms) == 1:
+        head = "grep -w CONFIG_" + syms[0]
+    else:
+        head = "grep -wE '%s'" % "|".join("CONFIG_" + s for s in syms)
+    return head + " /boot/config-$(uname -r)"
+
+
+def lsmod_name(mod):
+    """lsmod and modprobe both render a module's dashes as underscores, so this
+    is the string an admin types rather than the object name kbuild used."""
+    return str(mod or "").replace("-", "_")
+
+
+def exposure_block(row, detail, meta, tag="h3", tag_attr=""):
+    sh = exposure_shape(row, meta)
+    e = detail.get("exposure") or {}
+    m = detail.get("maintainers")
+    if not m and row.get("sub") is not None and meta.get("subsystems"):
+        entry = meta["subsystems"][row["sub"]]
+        m = {"name": entry[0], "list": entry[1], "status": entry[2]}
+    syms = exposure_symbols(detail)
+    # meta.modules carries a module name only where some flavour really does
+    # build it as a module.  Where the code is built in or not built at all, a
+    # module name would send the reader looking for something that is not
+    # there, so the index row is the gate and not detail["exposure"]["mod"].
+    mod = ""
+    if row.get("mod") is not None and meta.get("modules"):
+        mod = meta["modules"][row["mod"]]
+    cmd = config_command(syms)
+
+    facts = []
+    if m:
+        trail = []
+        if m.get("pattern"):
+            trail.append("MAINTAINERS section matched on " + m["pattern"])
+        if m.get("list"):
+            trail.append(m["list"])
+        if m.get("status"):
+            trail.append(m["status"])
+        facts.append("<dt>What this is</dt><dd>%s%s</dd>"
+                     % (esc(m.get("name") or ""),
+                        ('<span class="sub">%s</span>' % esc(" · ".join(trail)))
+                        if trail else ""))
+    if mod:
+        facts.append('<dt>Kernel module</dt><dd class="mono">%s</dd>'
+                     % esc(lsmod_name(mod)))
+    elif e.get("mod") and sh["shape"] == "none":
+        facts.append('<dt>Kernel module</dt><dd><span class="dim">none to look '
+                     "for. The file would have gone into %s, and Debian does "
+                     "not compile it into that module, so finding %s in lsmod "
+                     "would say nothing about this CVE.</span></dd>"
+                     % (esc(lsmod_name(e["mod"])), esc(lsmod_name(e["mod"]))))
+    if syms:
+        facts.append('<dt>Build switch%s</dt><dd class="mono">%s</dd>%s'
+                     % ("" if len(syms) == 1 else "es",
+                        ", ".join(esc("CONFIG_" + s) for s in syms),
+                        "" if len(syms) == 1 else
+                        "<dt>Reads as</dt><dd>all on means the file is "
+                        "compiled; any one off means it is not.</dd>"))
+
+    checks = []
+    if cmd:
+        checks.append('<pre class="cmd"><code>%s</code></pre>'
+                      '<p class="cmd-note">Reads the booted kernel\'s own '
+                      "configuration, on the machine and nowhere else. "
+                      '<span class="mono">=y</span> is built in, '
+                      '<span class="mono">=m</span> is a module, and an '
+                      '<span class="mono">is not set</span> line means the code '
+                      "is not there.</p>" % esc(cmd))
+    if mod:
+        checks.append('<pre class="cmd"><code>%s</code></pre>'
+                      '<p class="cmd-note">Prints a line if that module is '
+                      "loaded right now, and nothing if it is not. One that is "
+                      "not loaded can still be loaded later by anything that "
+                      "needs it.</p>" % esc("lsmod | grep -w " + lsmod_name(mod)))
+
+    sources = meta.get("sources") or {}
+    cites = []
+    if m and sources.get("maintainers"):
+        cites.append(src(sources["maintainers"],
+                         "Subsystem source: the kernel MAINTAINERS file",
+                         "MAINTAINERS"))
+    if syms and sources.get("kernel_tree"):
+        cites.append(src(sources["kernel_tree"],
+                         "Build switch source: the kernel kbuild Makefiles",
+                         "kbuild Makefiles"))
+    if sh["known"] and sources.get("debian_config"):
+        cites.append(src(sources["debian_config"],
+                         "Configuration source: Debian's linux-config packages",
+                         "Debian linux-config packages"))
+
+    gap_note = ""
+    if sh["unresolved"]:
+        gap_note = ('<p class="cmd-note">Where a release above reads "not '
+                    'established", no build rule for the affected file was found '
+                    "in that release's kernel tree. That is a gap in this "
+                    "lookup, not a finding that the code is absent.</p>")
+
+    aside = (('<dl class="kv exposure-kv">%s</dl>' % "".join(facts)) if facts else "")
+    if checks:
+        aside += "<h4>Check it on the machine</h4>%s" % "".join(checks)
+
+    return ('<section class="exposure x-%s">'
+            "<%s%s>Does this reach the machine in front of you?</%s>"
+            '<p class="exposure-lead">%s</p>'
+            # With nothing known about the code there is no second column, and
+            # a half-empty grid would read as something failing to load.
+            "%s<div>%s%s"
+            '<p class="panel-note">From the configuration Debian publishes for '
+            "every kernel flavour it builds. It covers only the architectures "
+            'Debian ships a <span class="mono">linux-config</span> package '
+            "for, and nothing about a kernel you built yourself. Debian's own "
+            "status below stays authoritative about the source package.%s</p>"
+            "</div>%s</div></section>"
+            % (sh["shape"], tag, tag_attr, tag, exposure_lead(sh),
+               '<div class="exposure-grid">' if aside else "<div>",
+               exposure_releases(detail, meta, sh), gap_note,
+               ('<span class="srcline">%s</span>' % " ".join(cites)) if cites else "",
+               ("<div>%s</div>" % aside) if aside else ""))
+
+# --------------------------------- what other distributions wrote
+# Ports of the functions of the same name in site/app.js.
+
+CC_BY_URL = "https://creativecommons.org/licenses/by/4.0/"
+
+
+def prose_attribution(info, rec, cve):
+    """The licence line that has to sit with the text wherever it is shown.
+    Red Hat's material is CC BY 4.0, which requires naming the source and
+    linking the original; both come out of meta.prose_sources rather than
+    being written into the page."""
+    licence = info.get("licence") or ""
+    deed = CC_BY_URL if licence.upper().startswith("CC BY") else (info.get("licence_url") or "")
+    parts = ["Written by %s and quoted here unchanged"
+             % esc(info.get("attribution") or info.get("name") or "")]
+    if licence:
+        parts.append("under %s" % (ext_link(deed, licence, licence + " licence")
+                                   if deed else esc(licence)))
+    out = ('<p class="prose-attr">%s. %s.'
+           % (" ".join(parts),
+              ext_link(rec.get("url") or "", "The original record for " + cve)))
+    if info.get("licence_url") and deed != info["licence_url"]:
+        out += " " + ext_link(info["licence_url"], "the publisher's terms",
+                              (info.get("name") or "") + " data licence terms")
+    return out + "</p>"
+
+
+def prose_fields(rec):
+    """Labels arrive ready to render, in the order the source wrote them, so
+    the list is walked rather than picked over by key."""
+    out = []
+    for f in rec.get("fields") or []:
+        out.append(
+            '<div class="prose-field"><h5>%s%s</h5>%s'
+            '<p class="prose-text">%s</p></div>'
+            % (esc(f.get("label") or f.get("key") or ""),
+               (' <span class="dim">by %s</span>' % esc(f["author"]))
+               if f.get("author") else "",
+               ('<p class="cmd-note">This is the source\'s standard wording '
+                'for "no workaround available", not a workaround.</p>')
+               if f.get("template") else "",
+               esc(f.get("text") or "")))
+    return "".join(out)
+
+
+def prose_card(key, info, detail, cve):
+    """Four answers that are genuinely different and must not collapse into
+    one: the source wrote something; the source has no record of this CVE; the
+    source has a record and wrote nothing; and nobody looked."""
+    name = info.get("name") or key
+    rec = (detail.get("notes") or {}).get(key)
+    head = '<h4 class="prose-name">%s</h4>' % esc(name)
+
+    # quoted is the licence gate.  A source that does not carry it gets its
+    # name and its link and nothing else, whatever a data file may hold.
+    if rec and rec.get("quoted") is True and (rec.get("fields") or []):
+        bits = []
+        if rec.get("severity"):
+            bits.append("rated " + esc(rec["severity"]))
+        if rec.get("date"):
+            bits.append("dated " + esc(rec["date"]))
+        return ('<article class="prose-src has-text">%s%s%s%s</article>'
+                % (head,
+                   ('<p class="prose-meta">%s</p>' % " · ".join(bits)) if bits else "",
+                   prose_fields(rec), prose_attribution(info, rec, cve)))
+    if rec:
+        return ('<article class="prose-src">%s<p class="prose-none">%s has '
+                "written about this CVE. This project has no licence to "
+                "reproduce their wording, so only the link is here. %s</p>"
+                "</article>"
+                % (head, esc(name),
+                   ext_link(rec.get("url") or "", "Read it at " + name,
+                            name + " on " + cve)))
+    state = (detail.get("notes_state") or {}).get(key)
+    if state == "absent":
+        body = ("%s does not track this CVE. Their published record was looked "
+                "up and there is none." % esc(name))
+    elif state == "silent":
+        body = ("%s tracks this CVE but published no write-up of their own for "
+                "it." % esc(name))
+    else:
+        body = "Not checked, so nothing was established either way."
+    return ('<article class="prose-src">%s<p class="prose-none">%s</p>'
+            "</article>" % (head, body))
+
+
+def prose_unchecked(sources, keys):
+    """Nobody looked at any source for this CVE, which is the honest answer
+    for everything outside the population the write-ups were collected over.
+    Said once, naming the sources, rather than repeated per source."""
+    names = [(sources.get(k) or {}).get("name") or k for k in keys]
+    return ('<p class="prose-none">Not checked. Write-ups are looked up only '
+            "for the CVEs unfixed in some Debian release, plus everything in "
+            "the CISA KEV catalogue, and this one falls outside that set, so "
+            "neither %s was consulted. That is not the same as their having "
+            "nothing to say.</p>" % esc(" nor ".join(names)))
+
+
+def notes_block(row, detail, meta, tag="h3", tag_attr=""):
+    sources = meta.get("prose_sources") or {}
+    if not sources:
+        return ""
+    return ('<section class="prose-block">'
+            "<%s%s>What other distributions have written</%s>"
+            '<p class="panel-note">Other security teams write about the same CVE '
+            "ids in plain language, and sometimes publish a workaround for the "
+            "time before a fixed package exists. None of it is Debian's "
+            "position.</p>%s</section>"
+            % (tag, tag_attr, tag,
+               ('<div class="prose-list">%s</div>'
+                % "".join(prose_card(k, sources[k] or {}, detail, row["id"])
+                          for k in sources))
+               if detail.get("notes_examined")
+               else prose_unchecked(sources, list(sources))))
+
+
 def meta_description(row, meta):
     """A one-line answer for the search result snippet, built only from the
     published status of each release."""
@@ -607,6 +1015,10 @@ def render_page(row, detail, reasons, meta, base_url, now):
       Debian urgency: {urgency}.</p>
   </section>
 
+  <section class="panel" id="exposure">
+    <div class="detail">{exposure_block}</div>
+  </section>
+
   <section class="panel" id="status">
     <h2 class="panel-h">What to do, per Debian release</h2>
     <p class="panel-note">Debian's own status for {cve} in every release this site
@@ -616,6 +1028,10 @@ def render_page(row, detail, reasons, meta, base_url, now):
       <th scope="col">Release</th><th scope="col">Status</th>
       <th scope="col">Version</th><th scope="col">What this means</th>
     </tr></thead><tbody>{answer_rows}</tbody></table></div></div>
+  </section>
+
+  <section class="panel" id="elsewhere">
+    <div class="detail">{notes_block}</div>
   </section>
 
   <section class="panel">
@@ -685,6 +1101,9 @@ def render_page(row, detail, reasons, meta, base_url, now):
         urgency=esc(row.get("urg") or "not yet assigned"),
         urgency_dd=urgency_dd,
         answer_rows=answer_rows(row, detail, meta),
+        exposure_block=exposure_block(row, detail, meta, "h2",
+                                      ' class="panel-h"'),
+        notes_block=notes_block(row, detail, meta, "h2", ' class="panel-h"'),
         description_text=esc(detail.get("desc") or "No description published."),
         files_block=files_block,
         links="".join(ext_link(u, t) for t, u in links),

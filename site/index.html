@@ -129,6 +129,16 @@
           <select id="area"><option value="any">any</option></select>
         </div>
         <div class="field">
+          <label for="built">Debian builds it</label>
+          <select id="built">
+            <option value="any">any</option>
+            <option value="none">not built in any release</option>
+            <option value="partial">not built in some releases</option>
+            <option value="built">built in every release with an answer</option>
+            <option value="unknown">not established</option>
+          </select>
+        </div>
+        <div class="field">
           <label for="sort">Sort</label>
           <select id="sort">
             <option value="new">newest first</option>
@@ -190,6 +200,24 @@
           <dt><span class="state-chip s-N">not affected</span></dt>
           <dd>This release never shipped the vulnerable code.</dd>
         </dl>
+      </div>
+      <div class="explain-group">
+        <h3 class="explain-h">Does Debian build the code?</h3>
+        <p class="explain-note">
+          Debian publishes the full kernel configuration for every flavour it
+          builds, so whether a release compiles the file the CVE is about is a
+          lookup rather than a guess. One letter per release, from Debian's own
+          configuration. A lower-case letter means every flavour of that release
+          agrees; an upper-case letter means the flavours differ. Open any CVE
+          for the switch name and the command that checks it locally.
+        </p>
+        <dl class="explain-dl cfg-legend" id="cfg-legend"></dl>
+        <p class="explain-note">
+          <strong>Not established is not the same as not built.</strong> It means
+          no build rule for the affected file was found, so nothing is known
+          either way. Debian's own per-release status stays authoritative about
+          the source package whatever these letters say.
+        </p>
       </div>
       <div class="explain-group">
         <h3 class="explain-h">Triage signals</h3>

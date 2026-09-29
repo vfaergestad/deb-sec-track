@@ -120,7 +120,7 @@ const VIEWS = [
 
 const state = {
   view: 'latest', q: '', rel: 'any', status: 'any',
-  sev: 'any', av: 'any', area: 'any', sort: '', deep: false,
+  sev: 'any', av: 'any', area: 'any', built: 'any', sort: '', deep: false,
 };
 
 let meta = null;
@@ -520,6 +520,7 @@ async function boot() {
   buildViewTabs();
   buildReleaseOptions();
   buildAreaOptions();
+  renderConfigLegend();
   $('#deep-size').textContent = '(~' + Math.round(meta.total * 1.4 / 1000) + ' MB)';
   wireControls();
   renderHistory();
@@ -620,6 +621,17 @@ function buildAreaOptions() {
   }
 }
 
+/* The legend for the build-state letters, written out of meta.config_codes
+ * rather than copied into the markup, so the key on the page is the same
+ * table the data is encoded with. */
+function renderConfigLegend() {
+  const host = $('#cfg-legend');
+  if (!host || !meta.config_codes) return;
+  host.innerHTML = Object.keys(meta.config_codes).map((letter) =>
+    '<dt><span class="cfg-chip t-' + cfgTone(letter) + '">' + esc(letter) +
+    '</span></dt><dd>' + esc(meta.config_codes[letter]) + '</dd>').join('');
+}
+
 function renderViewCounts() {
   for (const v of VIEWS) {
     const el = document.querySelector('[data-count="' + v.id + '"]');
@@ -646,6 +658,7 @@ function wireControls() {
   bind('#sev', 'sev');
   bind('#av', 'av');
   bind('#area', 'area');
+  bind('#built', 'built');
   bind('#sort', 'sort');
 
   // A pasted CVE id is a lookup, not a search: go straight to the answer.
@@ -723,7 +736,8 @@ function wireControls() {
 
   $('#reset').addEventListener('click', () => {
     Object.assign(state, {
-      rel: 'any', status: 'any', sev: 'any', av: 'any', area: 'any', sort: '',
+      rel: 'any', status: 'any', sev: 'any', av: 'any', area: 'any',
+      built: 'any', sort: '',
     });
     apply();
   });
@@ -757,6 +771,7 @@ function syncControls() {
   $('#sev').value = state.sev;
   $('#av').value = state.av;
   $('#area').value = state.area;
+  $('#built').value = state.built;
   $('#sort').value = state.sort || view().sort;
   $('#clear-q').hidden = !state.q;
   document.querySelectorAll('.view-tab').forEach((b) => {
@@ -843,8 +858,13 @@ function apply() {
     if (state.av !== 'any' && r.av !== state.av) return false;
     if (state.area !== 'any' && r.area !== state.area) return false;
     if (state.sev !== 'any' && severityOf(r) !== state.sev) return false;
+    // Only where the reader asked for it: the shape is a walk over the
+    // release columns, and doing it for every row on every keystroke would
+    // be work nobody asked for.
+    if (state.built !== 'any' && exposureShape(r).shape !== state.built) return false;
     if (terms.length) {
-      const hay = (r.id + ' ' + r.sum + ' ' + (r.area || '')).toLowerCase() +
+      const hay = (r.id + ' ' + r.sum + ' ' + (r.area || '') + ' ' +
+        subsystemName(r) + ' ' + moduleNameOf(r)).toLowerCase() +
         (state.deep ? ' ' + (deepText.get(r.id) || '') : '');
       for (const t of terms) if (!hay.includes(t)) return false;
     }
@@ -952,6 +972,41 @@ function renderMore() {
   rendered = end;
 }
 
+/* The two interned tables in meta.json: the names repeat across thousands of
+ * rows, so an index row carries an offset rather than the string. */
+function subsystemName(r) {
+  if (r.sub === undefined || !meta.subsystems) return '';
+  const entry = meta.subsystems[r.sub];
+  return entry ? entry[0] : '';
+}
+
+function moduleNameOf(r) {
+  if (r.mod === undefined || !meta.modules) return '';
+  return meta.modules[r.mod] || '';
+}
+
+/* The CNA writes a commit subject, which is the complaint this answers: the
+ * name does not say what the thing is.  The kernel's own MAINTAINERS name for
+ * the code goes under it, where the directory already sat. */
+function rowSubLine(r) {
+  const name = subsystemName(r);
+  if (!r.area && !name) return '';
+  return '<span class="sub">' +
+    (r.area ? '<span class="mono">' + esc(r.area) + '/</span>' : '') +
+    (name ? (r.area ? ' ' : '') + '<span class="subsys">' + esc(name) + '</span>' : '') +
+    '</span>';
+}
+
+/* The one exposure state worth seeing before a row is opened: Debian compiles
+ * the affected code into no kernel it ships, in any release shown.  It sits
+ * beside triageBadges() rather than inside it, because that function is
+ * mirrored character for character in scripts/render_pages.py. */
+function exposureBadge(r) {
+  if (exposureShape(r).shape !== 'none') return '';
+  return ' <span class="badge notbuilt" title="Debian does not enable this code ' +
+    'on any kernel flavour it builds, in any release shown">not built</span>';
+}
+
 function triageBadges(r) {
   const out = [];
   if (r.kev) out.push('<span class="badge kev" title="Listed in CISA\'s Known Exploited Vulnerabilities catalogue">KEV</span>');
@@ -993,9 +1048,9 @@ function rowEl(r) {
     '<td class="cve">' + esc(r.id) + '</td>' +
     '<td class="when">' + fmtDate(r.pub) +
       (r.pub ? '<span class="sub">' + agoLabel(r.pub) + '</span>' : '') + '</td>' +
-    '<td class="sum">' + esc(r.sum) +
-      (r.area ? '<span class="sub mono">' + esc(r.area) + '/</span>' : '') + '</td>' +
-    '<td><div class="triage-cell">' + triageBadges(r) + '</div></td>' +
+    '<td class="sum">' + esc(r.sum) + rowSubLine(r) + '</td>' +
+    '<td><div class="triage-cell">' + triageBadges(r) +
+      exposureBadge(r) + '</div></td>' +
     '<td class="pills-cell"><div class="pills">' + releasePills(r) + '</div></td>';
   tr.addEventListener('click', () => toggleDetail(tr, r));
   return tr;
@@ -1123,6 +1178,395 @@ async function toggleReasons(btn) {
   btn.textContent = 'Hide the reasoning';
 }
 
+/* ------------------------------------------------- exposure, and the checks */
+
+/* The letters in `cfg` are documented in meta.config_codes, and their case
+ * carries meaning: lower case means every kernel flavour Debian builds for
+ * that release agrees, upper case means the flavours disagree and some of
+ * them do not build the code at all.  Nothing here folds the two together,
+ * and `?` ("not established") is never treated as `n` ("not built"). */
+const cfgWord = (letter) =>
+  (meta.config_codes && meta.config_codes[letter]) || 'not established';
+
+/* Tone only: which of the four shapes a single letter belongs to, used for
+ * the chip colour and for nothing else. */
+function cfgTone(letter) {
+  if (letter === 'n') return 'none';
+  if (letter === '?' || !letter) return 'unknown';
+  return letter === letter.toLowerCase() ? 'all' : 'some';
+}
+
+/* Which releases this CVE applies to, what letter the build reported for
+ * each, and which shape the row as a whole is in.  The shape is a count of
+ * letters, not a judgement.  "none" is deliberately the strictest of the
+ * four: every release this CVE applies to has to say `n`, so one release
+ * whose build rule could not be established is enough to make it "partial"
+ * instead.  A `?` never helps a row qualify as not built. */
+function exposureShape(r) {
+  const seen = [];
+  meta.columns.forEach((col, i) => {
+    if (r.st[i] === '-') return;
+    seen.push({ col: col, i: i, letter: (r.cfg && r.cfg[i]) || '?' });
+  });
+  const known = seen.filter((s) => s.letter !== '?');
+  const none = known.filter((s) => s.letter === 'n');
+  let shape = 'built';
+  if (!known.length) shape = 'unknown';
+  else if (none.length === seen.length) shape = 'none';
+  else if (none.length) shape = 'partial';
+  return {
+    seen: seen, known: known, none: none, shape: shape,
+    unresolved: seen.length - known.length,
+  };
+}
+
+const relCount = (n) => n + ' release' + (n === 1 ? '' : 's');
+
+/* The one sentence at the top of the panel.  Every clause in it is read off
+ * the letters above; where a release could not be established it says so
+ * rather than counting it either way. */
+function exposureLead(sh) {
+  const gap = sh.unresolved
+    ? ' The build rule could not be established for ' + relCount(sh.unresolved) +
+      ', so nothing is claimed about those.'
+    : '';
+  if (sh.shape === 'unknown') {
+    return '<b>Not established.</b> This site could not find the build rule ' +
+      'for the affected file in the kernel trees Debian ships, so it has no ' +
+      'answer about whether Debian compiles this code. Read that as unknown, ' +
+      'never as absent.';
+  }
+  if (sh.shape === 'none') {
+    return '<b>Debian does not build this code.</b> In ' +
+      relCount(sh.none.length) + ' below, every kernel flavour Debian ' +
+      'publishes has the switch off, so the vulnerable file is compiled into ' +
+      'no kernel binary Debian ships.' + gap;
+  }
+  if (sh.shape === 'partial') {
+    const rest = sh.known.length - sh.none.length;
+    return '<b>Debian does not build this code in ' + relCount(sh.none.length) +
+      '.</b>' +
+      (rest
+        ? ' It does build it in ' + relCount(rest) + ', so the answer depends ' +
+          'on which release the machine runs.'
+        : '') + gap;
+  }
+  const upper = sh.known.some((s) => s.letter !== s.letter.toLowerCase());
+  if (upper) {
+    return '<b>Debian builds this, but not on every flavour.</b> At least one ' +
+      'release below builds the code on some of its kernel flavours and not ' +
+      'on others, so the answer depends on the architecture and flavour ' +
+      'installed.' + gap;
+  }
+  // With a release unaccounted for, "every release below" would be a claim
+  // about a release this lookup has no answer for.
+  const every = sh.unresolved ? 'Every release with an answer below' : 'Every release below';
+  if (sh.known.every((s) => s.letter === 'm')) {
+    return '<b>Debian builds this as a loadable module.</b> ' + every +
+      ' compiles it as a module on every flavour, so whether the code is in ' +
+      'the running kernel depends on whether that module is loaded.' + gap;
+  }
+  return '<b>Debian builds this code.</b> ' + every + ' compiles the affected ' +
+    'file into the kernels it ships.' + gap;
+}
+
+/* The flavours of one release that do not build the code at all.  The string
+ * is one letter per flavour, in the order meta.json lists them for that
+ * column, and is present only where that release's flavours disagree. */
+function offFlavours(col, flav) {
+  const str = (flav || {})[col.id] || '';
+  const names = col.config_flavours || [];
+  const out = [];
+  for (let k = 0; k < str.length && k < names.length; k++) {
+    if (str[k] === 'n') out.push(names[k]);
+  }
+  return out;
+}
+
+/* One line per answer, not per release: releases that agree are named
+ * together, because five copies of one sentence is not five pieces of
+ * information.  The legend for each letter used is printed once underneath,
+ * so the meaning is on the page without being repeated per row. */
+function exposureReleases(r, d, sh) {
+  const flav = (d.exposure && d.exposure.flav) || {};
+  const groups = [];
+  for (const s of sh.seen) {
+    const off = offFlavours(s.col, flav);
+    const key = s.letter + '\u0000' + off.join(',');
+    const last = groups[groups.length - 1];
+    if (last && last.key === key) last.names.push(s.col.label);
+    else groups.push({ key: key, letter: s.letter, off: off, names: [s.col.label] });
+  }
+  const rows = groups.map((g) =>
+    '<li class="cfg-row">' +
+    '<span class="cfg-rel">' + esc(g.names.join(', ')) + '</span>' +
+    '<span class="cfg-chip t-' + cfgTone(g.letter) + '">' + esc(g.letter) + '</span>' +
+    (g.off.length
+      ? '<span class="cfg-word">not built on ' + esc(g.off.join(', ')) + '</span>'
+      : '') +
+    '</li>').join('');
+  const seenLetters = [];
+  for (const g of groups) {
+    if (seenLetters.indexOf(g.letter) === -1) seenLetters.push(g.letter);
+  }
+  const key = seenLetters.map((l) =>
+    '<dt><span class="cfg-chip t-' + cfgTone(l) + '">' + esc(l) + '</span></dt>' +
+    '<dd>' + esc(cfgWord(l)) + '</dd>').join('');
+  return '<ul class="cfg-list">' + rows + '</ul>' +
+    '<dl class="cfg-key">' + key + '</dl>';
+}
+
+/* Every Kconfig symbol that has to be on for the file to be compiled, taken
+ * over all releases.  Where the releases resolved to different symbol lists
+ * the union is what a reader should grep for, because they are looking at one
+ * machine and do not yet know which list applies to it. */
+function exposureSymbols(d) {
+  const e = d.exposure || {};
+  const out = new Set(e.sym || []);
+  for (const key of Object.keys(e.by || {})) {
+    for (const sym of (e.by[key].sym || [])) out.add(sym);
+  }
+  return [...out].sort();
+}
+
+/* The command a reader would actually type.  Generic and standard: one grep
+ * of the booted kernel's own configuration, one lsmod.  Nothing here knows
+ * anything about the machine, and nothing is invented: `-w` is what keeps
+ * CONFIG_BRIDGE from matching CONFIG_BRIDGE_CFM. */
+function configCommand(syms) {
+  if (!syms.length) return '';
+  return (syms.length === 1
+    ? 'grep -w CONFIG_' + syms[0]
+    : "grep -wE '" + syms.map((s) => 'CONFIG_' + s).join('|') + "'") +
+    ' /boot/config-$(uname -r)';
+}
+
+/* lsmod and modprobe both render a module's dashes as underscores, so this is
+ * the string an admin types rather than the object name kbuild used. */
+const lsmodName = (mod) => String(mod || '').replace(/-/g, '_');
+
+function exposureBlock(r, d) {
+  const sh = exposureShape(r);
+  const e = d.exposure || {};
+  const m = d.maintainers ||
+    (r.sub !== undefined && meta.subsystems ? {
+      name: meta.subsystems[r.sub][0],
+      list: meta.subsystems[r.sub][1],
+      status: meta.subsystems[r.sub][2],
+    } : null);
+  const syms = exposureSymbols(d);
+  // meta.modules carries a module name only where some flavour really does
+  // build it as a module.  Where the code is built in or not built at all, a
+  // module name would send the reader looking for something that is not
+  // there, so the index row is the gate and not d.exposure.mod.
+  const mod = (r.mod !== undefined && meta.modules) ? meta.modules[r.mod] : '';
+  const cmd = configCommand(syms);
+
+  const facts = [];
+  if (m) {
+    const trail = [];
+    if (m.pattern) trail.push('MAINTAINERS section matched on ' + m.pattern);
+    if (m.list) trail.push(m.list);
+    if (m.status) trail.push(m.status);
+    facts.push('<dt>What this is</dt><dd>' + esc(m.name) +
+      (trail.length ? '<span class="sub">' + esc(trail.join(' · ')) + '</span>' : '') +
+      '</dd>');
+  }
+  if (mod) {
+    facts.push('<dt>Kernel module</dt><dd class="mono">' + esc(lsmodName(mod)) +
+      '</dd>');
+  } else if (e.mod && sh.shape === 'none') {
+    facts.push('<dt>Kernel module</dt><dd>' +
+      '<span class="dim">none to look for. The file would have gone into ' +
+      esc(lsmodName(e.mod)) + ', and Debian does not compile it into that ' +
+      'module, so finding ' + esc(lsmodName(e.mod)) + ' in lsmod would say ' +
+      'nothing about this CVE.</span></dd>');
+  }
+  if (syms.length) {
+    facts.push('<dt>Build switch' + (syms.length === 1 ? '' : 'es') +
+      '</dt><dd class="mono">' +
+      syms.map((s) => esc('CONFIG_' + s)).join(', ') +
+      '</dd>' +
+      (syms.length > 1
+        ? '<dt>Reads as</dt><dd>all on means the file is compiled; any one ' +
+          'off means it is not.</dd>'
+        : ''));
+  }
+
+  const checks = [];
+  if (cmd) {
+    checks.push('<pre class="cmd"><code>' + esc(cmd) + '</code></pre>' +
+      '<p class="cmd-note">Reads the booted kernel\'s own configuration, on ' +
+      'the machine and nowhere else. <span class="mono">=y</span> is built in, ' +
+      '<span class="mono">=m</span> is a module, and an <span class="mono">is ' +
+      'not set</span> line means the code is not there.</p>');
+  }
+  if (mod) {
+    checks.push('<pre class="cmd"><code>' + esc('lsmod | grep -w ' + lsmodName(mod)) +
+      '</code></pre>' +
+      '<p class="cmd-note">Prints a line if that module is loaded right now, ' +
+      'and nothing if it is not. One that is not loaded can still be loaded ' +
+      'later by anything that needs it.</p>');
+  }
+
+  const sources = (meta.sources || {});
+  const cites = [];
+  if (m && sources.maintainers) {
+    cites.push(src(sources.maintainers,
+      'Subsystem source: the kernel MAINTAINERS file', 'MAINTAINERS'));
+  }
+  if (syms.length && sources.kernel_tree) {
+    cites.push(src(sources.kernel_tree,
+      'Build switch source: the kernel kbuild Makefiles', 'kbuild Makefiles'));
+  }
+  if (sh.known.length && sources.debian_config) {
+    cites.push(src(sources.debian_config,
+      'Configuration source: Debian\'s linux-config packages',
+      'Debian linux-config packages'));
+  }
+
+  const gapNote = sh.unresolved
+    ? '<p class="cmd-note">Where a release above reads "not established", no ' +
+      'build rule for the affected file was found in that release\'s kernel ' +
+      'tree. That is a gap in this lookup, not a finding that the code is absent.</p>'
+    : '';
+
+  const aside =
+    (facts.length ? '<dl class="kv exposure-kv">' + facts.join('') + '</dl>' : '') +
+    (checks.length ? '<h4>Check it on the machine</h4>' + checks.join('') : '');
+
+  return '<section class="exposure x-' + sh.shape + '">' +
+    '<h3>Does this reach the machine in front of you?</h3>' +
+    '<p class="exposure-lead">' + exposureLead(sh) + '</p>' +
+    // With nothing known about the code there is no second column, and a
+    // half-empty grid would read as something failing to load.
+    (aside ? '<div class="exposure-grid">' : '<div>') + '<div>' +
+      exposureReleases(r, d, sh) +
+      gapNote +
+      '<p class="panel-note">From the configuration Debian publishes for every ' +
+      'kernel flavour it builds. It covers only the architectures Debian ships ' +
+      'a <span class="mono">linux-config</span> package for, and nothing about ' +
+      'a kernel you built yourself. Debian\'s own status below stays ' +
+      'authoritative about the source package.' +
+      (cites.length ? '<span class="srcline">' + cites.join(' ') + '</span>' : '') +
+      '</p>' +
+    '</div>' + (aside ? '<div>' + aside + '</div>' : '') +
+    '</div></section>';
+}
+
+/* ------------------------------------------- what other distributions wrote */
+
+const CC_BY_URL = 'https://creativecommons.org/licenses/by/4.0/';
+
+/* The licence line that has to sit with the text wherever it is shown.  Red
+ * Hat's material is CC BY 4.0, which requires naming the source and linking
+ * the original; both come out of meta.prose_sources rather than being written
+ * into the page. */
+function proseAttribution(info, rec, cve) {
+  const licence = info.licence || '';
+  const deed = /^CC BY/i.test(licence) ? CC_BY_URL : (info.licence_url || '');
+  const parts = ['Written by ' + esc(info.attribution || info.name || '') +
+    ' and quoted here unchanged'];
+  if (licence) {
+    parts.push('under ' + (deed ? ext(deed, licence, licence + ' licence') : esc(licence)));
+  }
+  let out = '<p class="prose-attr">' + parts.join(' ') + '. ' +
+    ext(rec.url, 'The original record for ' + cve) + '.';
+  if (info.licence_url && deed !== info.licence_url) {
+    out += ' ' + ext(info.licence_url, 'the publisher\'s terms',
+      (info.name || '') + ' data licence terms');
+  }
+  return out + '</p>';
+}
+
+/* Labels arrive ready to render, in the order the source wrote them, so the
+ * list is walked rather than picked over by key. */
+function proseFields(rec) {
+  return (rec.fields || []).map((f) =>
+    '<div class="prose-field">' +
+    '<h5>' + esc(f.label || f.key || '') +
+      (f.author ? ' <span class="dim">by ' + esc(f.author) + '</span>' : '') +
+    '</h5>' +
+    (f.template
+      ? '<p class="cmd-note">This is the source\'s standard wording for ' +
+        '"no workaround available", not a workaround.</p>'
+      : '') +
+    '<p class="prose-text">' + esc(f.text || '') + '</p>' +
+    '</div>').join('');
+}
+
+/* Four answers that are genuinely different and must not collapse into one:
+ * the source wrote something; the source has no record of this CVE; the
+ * source has a record and wrote nothing; and nobody looked. */
+function proseCard(key, info, d, cve) {
+  const name = info.name || key;
+  const rec = (d.notes || {})[key];
+  const head = '<h4 class="prose-name">' + esc(name) + '</h4>';
+
+  // quoted is the licence gate.  A source that does not carry it gets its
+  // name and its link and nothing else, whatever a data file may hold.
+  if (rec && rec.quoted === true && (rec.fields || []).length) {
+    const bits = [];
+    if (rec.severity) bits.push('rated ' + esc(rec.severity));
+    if (rec.date) bits.push('dated ' + esc(rec.date));
+    return '<article class="prose-src has-text">' + head +
+      (bits.length
+        ? '<p class="prose-meta">' + bits.join(' · ') + '</p>' : '') +
+      proseFields(rec) + proseAttribution(info, rec, cve) + '</article>';
+  }
+  if (rec) {
+    return '<article class="prose-src">' + head +
+      '<p class="prose-none">' + esc(name) + ' has written about this CVE. ' +
+      'This project has no licence to reproduce their wording, so only the ' +
+      'link is here. ' + ext(rec.url, 'Read it at ' + name, name + ' on ' + cve) + '</p></article>';
+  }
+  const state = (d.notes_state || {})[key];
+  if (state === 'absent') {
+    return '<article class="prose-src">' + head +
+      '<p class="prose-none">' + esc(name) + ' does not track this CVE. ' +
+      'Their published record was looked up and there is none.</p></article>';
+  }
+  if (state === 'silent') {
+    return '<article class="prose-src">' + head +
+      '<p class="prose-none">' + esc(name) + ' tracks this CVE but published ' +
+      'no write-up of their own for it.</p></article>';
+  }
+  return '<article class="prose-src">' + head +
+    '<p class="prose-none">Not checked, so nothing was established either ' +
+    'way.</p></article>';
+}
+
+/* Nobody looked at any source for this CVE, which is the honest answer for
+ * everything outside the population the write-ups were collected over.  Said
+ * once, naming the sources, rather than repeated per source. */
+function proseUnchecked(sources, keys) {
+  const names = keys.map((k) => (sources[k] || {}).name || k);
+  return '<p class="prose-none">Not checked. Write-ups are looked up only for ' +
+    'the CVEs unfixed in some Debian release, plus everything in the CISA KEV ' +
+    'catalogue, and this one falls outside that set, so neither ' +
+    esc(names.join(' nor ')) + ' was consulted. That is not the same as ' +
+    'their having nothing to say.</p>';
+}
+
+function notesBlock(r, d) {
+  const sources = meta.prose_sources || {};
+  const keys = Object.keys(sources);
+  if (!keys.length) return '';
+  return '<section class="prose-block">' +
+    '<h3>What other distributions have written</h3>' +
+    '<p class="panel-note">Other security teams write about the same CVE ids ' +
+    'in plain language, and sometimes publish a workaround for the time before ' +
+    'a fixed package exists. None of it is Debian\'s position.</p>' +
+    (d.notes_examined
+      ? '<div class="prose-list">' +
+        keys.map((k) => proseCard(k, sources[k] || {}, d, r.id)).join('') +
+        '</div>'
+      : proseUnchecked(sources, keys)) +
+    '</section>';
+}
+
+/* -------------------------------------------------------------- detail */
+
 function detailHtml(r, d) {
   const isCve = CVE_RE.test(r.id);
   const links = [['Permalink for this CVE', 'cve/' + r.id + '.html', false],
@@ -1191,6 +1635,7 @@ function detailHtml(r, d) {
 
   return '<div class="detail">' +
     '<div class="detail-tools">' + starHtml(r.id, true) + '</div>' +
+    exposureBlock(r, d) +
     '<h3>What to do, per Debian release</h3>' +
     '<p class="panel-note">Every status below is the one the Debian Security Team ' +
       'publishes for this CVE. ' +
@@ -1198,6 +1643,7 @@ function detailHtml(r, d) {
     '<div class="tablewrap"><table class="answer"><thead><tr>' +
       '<th>Release</th><th>Status</th><th>Version</th><th>What this means</th>' +
     '</tr></thead><tbody>' + actionRows + '</tbody></table></div>' +
+    notesBlock(r, d) +
     '<div class="detail-grid"><div>' +
       '<h3>What the bug is</h3>' +
       '<p class="desc">' + esc(d.desc || 'No description published.') + '</p>' +
@@ -1301,7 +1747,7 @@ function writeHash() {
   const parts = [];
   const def = {
     view: 'latest', q: '', rel: 'any', status: 'any',
-    sev: 'any', av: 'any', area: 'any', sort: '',
+    sev: 'any', av: 'any', area: 'any', built: 'any', sort: '',
   };
   for (const [k, v] of Object.entries(def)) {
     if (state[k] !== v) parts.push(k + '=' + encodeURIComponent(state[k]));
@@ -1331,7 +1777,8 @@ function readHash() {
   }
   // A bare #stars= link is a starred set, so land on it rather than on Latest.
   if (shared && !sawView) state.view = 'starred';
-  if (state.rel !== 'any' || state.status !== 'any' || state.area !== 'any') {
+  if (state.rel !== 'any' || state.status !== 'any' || state.area !== 'any' ||
+      state.built !== 'any') {
     $('#refine').open = true;
   }
 }

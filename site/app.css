@@ -920,3 +920,237 @@ a.src::after {
 @media (max-width: 560px) {
   .reason { grid-template-columns: minmax(0, 1fr); gap: 5px; }
 }
+
+/* ---------- exposure: does Debian build the affected code ---------- */
+
+/* The answer a sysadmin opens a CVE for, so it sits at the top of the panel
+   and is allowed to take the width.  The tint follows the shape of the
+   answer and never stands in for it: the sentence says which one it is. */
+.exposure {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: 12px 14px 14px;
+  margin: 14px 0 4px;
+}
+.exposure > h3:first-child { margin-top: 0; }
+.exposure.x-none    { border-color: var(--green); background: var(--green-bg); }
+.exposure.x-partial { border-color: var(--amber); background: var(--amber-bg); }
+.exposure.x-unknown { border-color: var(--line); background: var(--panel-2); }
+
+.exposure-lead {
+  margin: 0 0 12px;
+  font-size: 14px;
+  line-height: 1.55;
+  max-width: 88ch;
+}
+.exposure-lead b {
+  display: block;
+  font-size: 18px;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  margin-bottom: 3px;
+}
+.x-none .exposure-lead b    { color: var(--green); }
+.x-partial .exposure-lead b { color: var(--amber); }
+
+.exposure-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  gap: 6px 22px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .exposure-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+.cfg-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 13px;
+}
+.cfg-row {
+  display: grid;
+  grid-template-columns: minmax(0, 13rem) max-content minmax(0, 1fr);
+  gap: 2px 12px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-top: 1px solid var(--line-soft);
+}
+.cfg-row:first-child { border-top: 0; }
+.cfg-rel { font-weight: 600; }
+.cfg-rel .sub,
+.cfg-word .sub {
+  display: block;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--ink-dim);
+  margin-top: 2px;
+}
+.cfg-word { color: var(--ink-dim); }
+
+/* The raw letter out of the data file, shown so the sentence beside it can be
+   checked against site/data rather than taken on trust. */
+.cfg-chip {
+  font: 600 12px/1.5 var(--mono);
+  min-width: 1.9em;
+  text-align: center;
+  padding: 0 6px;
+  border-radius: 4px;
+  border: 1px solid;
+}
+/* The legend for the letters this CVE actually uses, printed once under the
+   list rather than repeated on every release line. */
+.cfg-key {
+  margin: 8px 0 10px;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 12px;
+  align-items: baseline;
+  font-size: 12.5px;
+  color: var(--ink-dim);
+}
+.cfg-key dt, .cfg-key dd { margin: 0; }
+
+.cfg-chip.t-none    { color: var(--green); background: var(--green-bg); border-color: var(--green); }
+.cfg-chip.t-all     { color: var(--blue);  background: var(--blue-bg);  border-color: var(--blue); }
+.cfg-chip.t-some    { color: var(--amber); background: var(--amber-bg); border-color: var(--amber); }
+.cfg-chip.t-unknown { color: var(--grey);  background: var(--grey-bg);  border-color: var(--line); }
+
+.exposure-kv { margin-bottom: 12px; }
+/* A single very long Kconfig symbol has no break opportunity and would
+   otherwise push the panel wider than a phone screen. */
+.exposure-kv dd { overflow-wrap: anywhere; }
+.exposure-kv dd .sub {
+  display: block;
+  font-size: 11.5px;
+  color: var(--ink-dim);
+  margin-top: 2px;
+}
+.exposure .srcline { margin-top: 6px; }
+
+.detail h4 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-dim);
+  margin: 14px 0 6px;
+}
+
+/* A command to type, not a code sample: wide enough to read, wrapping rather
+   than scrolling sideways on a phone. */
+pre.cmd {
+  margin: 0 0 4px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow-x: auto;
+}
+.exposure pre.cmd { background: var(--panel); }
+pre.cmd code {
+  font: 12.5px/1.6 var(--mono);
+  color: var(--ink);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.cmd-note {
+  margin: 0 0 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-dim);
+  max-width: 78ch;
+}
+.cmd-note .mono { font-size: 11.5px; }
+
+.badge.notbuilt { color: var(--green); background: var(--green-bg); border-color: var(--green); }
+
+.subsys {
+  display: inline-block;
+  max-width: 44ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+.explain-note {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--ink-dim);
+  max-width: 80ch;
+}
+.explain-dl + .explain-note { margin: 10px 0 0; }
+.cfg-legend { grid-template-columns: max-content minmax(0, 1fr); }
+
+/* ---------- what other distributions have written ---------- */
+
+.prose-block {
+  border-top: 1px solid var(--line-soft);
+  margin-top: 18px;
+  padding-top: 2px;
+}
+.prose-list {
+  display: grid;
+  gap: 12px;
+}
+.prose-src {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  background: var(--panel);
+}
+.prose-src.has-text { background: var(--panel-2); }
+/* The source's name is a name, not a section label, so it opts out of the
+   uppercase treatment `.detail h4` gives the headings around it. */
+.detail h4.prose-name {
+  margin: 0 0 4px;
+  font: 600 13px/1.4 var(--sans);
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--ink);
+}
+.prose-meta {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--ink-dim);
+}
+.prose-none {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-dim);
+  max-width: 84ch;
+}
+.prose-field + .prose-field { margin-top: 10px; }
+.prose-field h5 {
+  margin: 0 0 3px;
+  font: 600 12px/1.5 var(--sans);
+  color: var(--ink-dim);
+}
+/* Quoted verbatim, so the source's own line breaks are kept. */
+.prose-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  max-width: 88ch;
+  overflow-wrap: anywhere;
+}
+/* The attribution the licence requires, kept with the text it belongs to. */
+.prose-attr {
+  margin: 10px 0 0;
+  padding-top: 7px;
+  border-top: 1px solid var(--line-soft);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--ink-dim);
+  max-width: 88ch;
+}
+
+@media (max-width: 560px) {
+  .cfg-row { grid-template-columns: max-content minmax(0, 1fr); gap: 2px 10px; }
+  .cfg-rel { grid-column: 1 / -1; }
+  .exposure-lead b { font-size: 17px; }
+  .subsys { max-width: 30ch; }
+}
