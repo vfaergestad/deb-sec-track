@@ -648,8 +648,6 @@ table.mini th {
 @media (max-width: 720px) {
   .c-when, td.when { display: none; }
   .panel { padding: 13px; }
-  .exposure-lead { font-size: 15px; }
-  .exposure-lead b { font-size: 22px; }
 }
 
 /* ---------- per-release answer table ---------- */
@@ -923,46 +921,53 @@ a.src::after {
 
 /* ---------- exposure: does Debian build the affected code ---------- */
 
-/* The answer a sysadmin opens a CVE for, so it sits at the top of the panel
-   and is allowed to take the width.  The tint follows the shape of the
-   answer and never stands in for it: the sentence says which one it is. */
-.exposure {
-  border: 1px solid var(--line);
-  background: var(--panel);
-  border-radius: var(--radius);
-  padding: 12px 14px 14px;
-  margin: 14px 0 4px;
-}
-.exposure > h3:first-child { margin-top: 0; }
-.exposure.x-none    { border-color: var(--green); background: var(--green-bg); }
-.exposure.x-partial { border-color: var(--amber); background: var(--amber-bg); }
-.exposure.x-unknown { border-color: var(--line); background: var(--panel-2); }
-
-.exposure-lead {
+/* One exposure answer outranks the per-release table, and only one: Debian
+   compiles the code into nothing it ships.  It gets a line, not a panel, so
+   the ninety per cent of CVEs that do not end there pay nothing for it.  A
+   left rule rather than a tint, because a tinted block is a section and this
+   is a sentence. */
+.not-built {
   margin: 0 0 12px;
-  font-size: 14px;
+  padding-left: 10px;
+  border-left: 3px solid var(--green);
+  font-size: 13.5px;
+  line-height: 1.5;
+  max-width: 92ch;
+}
+.not-built b { color: var(--green); }
+
+/* Everywhere else the build state is supporting detail inside "Where it
+   lives", so the lead reads as ordinary prose rather than as a headline. */
+.exposure-lead {
+  margin: 12px 0 10px;
+  font-size: 13px;
   line-height: 1.55;
   max-width: 88ch;
 }
-.exposure-lead b {
-  display: block;
-  font-size: 18px;
-  line-height: 1.3;
-  letter-spacing: -0.01em;
-  margin-bottom: 3px;
-}
-.x-none .exposure-lead b    { color: var(--green); }
-.x-partial .exposure-lead b { color: var(--amber); }
 
-.exposure-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
-  gap: 6px 22px;
-  align-items: start;
+/* The disclosure that holds the per-release letters and the prose behind
+   them.  The app toggles a button and a div, the same control the CVSS
+   reasoning uses; a static page has no script, so it wears the same label on
+   a native <details>.  Both end up looking like one control. */
+.built-btn { margin-top: 2px; }
+.built-out[hidden] { display: none; }
+details.built-out { margin-top: 2px; }
+details.built-out > summary.built-btn {
+  display: inline-block;
+  list-style: none;
+  margin: 0;
 }
-@media (max-width: 900px) {
-  .exposure-grid { grid-template-columns: minmax(0, 1fr); }
+details.built-out > summary::-webkit-details-marker { display: none; }
+/* The app's button says which way it will go by changing its own label; a
+   <summary> keeps one label whatever its state, so it carries the state as a
+   mark instead.  Drawn in CSS: it is decoration, and <details> already tells
+   a screen reader whether it is open. */
+details.built-out > summary.built-btn::before {
+  content: "\25B8";
+  padding-right: 7px;
+  color: var(--ink-dim);
 }
+details.built-out[open] > summary.built-btn::before { content: "\25BE"; }
 
 .cfg-list {
   list-style: none;
@@ -1028,7 +1033,6 @@ a.src::after {
   color: var(--ink-dim);
   margin-top: 2px;
 }
-.exposure .srcline { margin-top: 6px; }
 
 .detail h4 {
   font-size: 11px;
@@ -1048,7 +1052,6 @@ pre.cmd {
   border-radius: var(--radius);
   overflow-x: auto;
 }
-.exposure pre.cmd { background: var(--panel); }
 pre.cmd code {
   font: 12.5px/1.6 var(--mono);
   color: var(--ink);
@@ -1151,6 +1154,5 @@ pre.cmd code {
 @media (max-width: 560px) {
   .cfg-row { grid-template-columns: max-content minmax(0, 1fr); gap: 2px 10px; }
   .cfg-rel { grid-column: 1 / -1; }
-  .exposure-lead b { font-size: 17px; }
   .subsys { max-width: 30ch; }
 }

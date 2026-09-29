@@ -62,6 +62,11 @@ UNRESOLVED_CODES = "VIU"
 # That leaves under 5 MB of headroom, which is roughly 300 more pages: the
 # next thing that grows this tree needs either a tighter inclusion rule above
 # or a decision to raise this again.
+#
+# Folding that panel into "Where it lives" gave 0.5 MB of that headroom back
+# (99.65 MB to 99.15 MB on the 2026-09-29 data, the same 6,017 pages): one
+# section wrapper and one heading a page, not the prose, which is all still
+# there behind the disclosure.
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
 
 # Used for <link rel="canonical"> and the sitemap when --base-url is not given.
@@ -496,6 +501,17 @@ def exposure_shape(row, meta):
             "unresolved": len(seen) - len(known)}
 
 
+# The sentence that answers the whole question when Debian compiles the code
+# into nothing it ships.  Written once and used twice: in the lead, and on its
+# own above the per-release table, which is the only place an exposure answer
+# is allowed to outrank that table.
+NOT_BUILT_HEAD = "Debian does not build this code."
+
+# The label on the disclosure that holds the per-release build detail.  Same
+# words as the app's button, so a reader who has seen one recognises the other.
+BUILT_SHOW = "Show whether Debian builds this, per release"
+
+
 def rel_count(n):
     return "%d release%s" % (n, "" if n == 1 else "s")
 
@@ -514,10 +530,10 @@ def exposure_lead(sh):
                 "has no answer about whether Debian compiles this code. Read "
                 "that as unknown, never as absent.")
     if sh["shape"] == "none":
-        return ("<b>Debian does not build this code.</b> In %s below, every "
+        return ("<b>%s</b> In %s below, every "
                 "kernel flavour Debian publishes has the switch off, so the "
                 "vulnerable file is compiled into no kernel binary Debian "
-                "ships.%s" % (rel_count(len(sh["none"])), gap))
+                "ships.%s" % (NOT_BUILT_HEAD, rel_count(len(sh["none"])), gap))
     if sh["shape"] == "partial":
         rest = len(sh["known"]) - len(sh["none"])
         return ("<b>Debian does not build this code in %s.</b>%s%s"
@@ -620,7 +636,29 @@ def lsmod_name(mod):
     return str(mod or "").replace("-", "_")
 
 
-def exposure_block(row, detail, meta, tag="h3", tag_attr=""):
+def not_built_line(row, meta):
+    """The one exposure state that ends the question rather than informing it,
+    so the only one allowed above the per-release table.  Everything else about
+    how Debian builds the code is supporting detail and sits in "Where it
+    lives" below.  Port of notBuiltLine() in app.js."""
+    if exposure_shape(row, meta)["shape"] != "none":
+        return ""
+    return ('<p class="not-built"><b>%s</b> <span class="dim">The per-release '
+            'build detail is under "Where it lives" below.</span></p>'
+            % NOT_BUILT_HEAD)
+
+
+def where_block(row, detail, meta):
+    """Where the vulnerable code lives and whether Debian compiles it are one
+    subject, so they are one section.  What stays visible is what a reader acts
+    on: the files, the subsystem, the module name and the commands to type.
+    The per-release letters, the Kconfig chain and the prose behind them are
+    true but not decisive, so they start closed.
+
+    Port of whereBlock() in app.js.  The app hides the detail behind a button
+    it toggles in JavaScript; a static page has no script, so the same closed
+    by default disclosure is a native <details>, which is keyboard operable
+    and reports its own expanded state without one."""
     sh = exposure_shape(row, meta)
     e = detail.get("exposure") or {}
     m = detail.get("maintainers")
@@ -659,13 +697,17 @@ def exposure_block(row, detail, meta, tag="h3", tag_attr=""):
                      "not compile it into that module, so finding %s in lsmod "
                      "would say nothing about this CVE.</span></dd>"
                      % (esc(lsmod_name(e["mod"])), esc(lsmod_name(e["mod"]))))
+
+    # The switch names are what the grep above already spells out, so the chain
+    # itself is a re-reading of the command rather than a second instruction.
+    deep_facts = []
     if syms:
-        facts.append('<dt>Build switch%s</dt><dd class="mono">%s</dd>%s'
-                     % ("" if len(syms) == 1 else "es",
-                        ", ".join(esc("CONFIG_" + s) for s in syms),
-                        "" if len(syms) == 1 else
-                        "<dt>Reads as</dt><dd>all on means the file is "
-                        "compiled; any one off means it is not.</dd>"))
+        deep_facts.append('<dt>Build switch%s</dt><dd class="mono">%s</dd>%s'
+                          % ("" if len(syms) == 1 else "es",
+                             ", ".join(esc("CONFIG_" + s) for s in syms),
+                             "" if len(syms) == 1 else
+                             "<dt>Reads as</dt><dd>all on means the file is "
+                             "compiled; any one off means it is not.</dd>"))
 
     checks = []
     if cmd:
@@ -705,27 +747,38 @@ def exposure_block(row, detail, meta, tag="h3", tag_attr=""):
                     "in that release's kernel tree. That is a gap in this "
                     "lookup, not a finding that the code is absent.</p>")
 
-    aside = (('<dl class="kv exposure-kv">%s</dl>' % "".join(facts)) if facts else "")
-    if checks:
-        aside += "<h4>Check it on the machine</h4>%s" % "".join(checks)
+    inner = ('<p class="exposure-lead">%s</p>%s%s%s'
+             '<p class="panel-note">From the configuration Debian publishes for '
+             "every kernel flavour it builds. It covers only the architectures "
+             'Debian ships a <span class="mono">linux-config</span> package '
+             "for, and nothing about a kernel you built yourself. Debian's own "
+             "status above stays authoritative about the source package.%s</p>"
+             % (exposure_lead(sh),
+                exposure_releases(detail, meta, sh), gap_note,
+                ('<dl class="kv exposure-kv">%s</dl>' % "".join(deep_facts))
+                if deep_facts else "",
+                ('<span class="srcline">%s</span>' % " ".join(cites)) if cites else ""))
 
-    return ('<section class="exposure x-%s">'
-            "<%s%s>Does this reach the machine in front of you?</%s>"
-            '<p class="exposure-lead">%s</p>'
-            # With nothing known about the code there is no second column, and
-            # a half-empty grid would read as something failing to load.
-            "%s<div>%s%s"
-            '<p class="panel-note">From the configuration Debian publishes for '
-            "every kernel flavour it builds. It covers only the architectures "
-            'Debian ships a <span class="mono">linux-config</span> package '
-            "for, and nothing about a kernel you built yourself. Debian's own "
-            "status below stays authoritative about the source package.%s</p>"
-            "</div>%s</div></section>"
-            % (sh["shape"], tag, tag_attr, tag, exposure_lead(sh),
-               '<div class="exposure-grid">' if aside else "<div>",
-               exposure_releases(detail, meta, sh), gap_note,
-               ('<span class="srcline">%s</span>' % " ".join(cites)) if cites else "",
-               ("<div>%s</div>" % aside) if aside else ""))
+    files = ""
+    if detail.get("files"):
+        files = ('<p class="panel-note">The fix touches these files. If the '
+                 "subsystem is one you do not use, the practical exposure is "
+                 'lower, though the package is still the vulnerable one.</p>'
+                 '<p class="files">%s</p>'
+                 % "<br />".join(esc(f) for f in detail["files"]))
+
+    if not files and not facts and not checks and not sh["seen"]:
+        return ""
+
+    return ("<h3>Where it lives</h3>%s%s%s"
+            '<details class="built-out"><summary class="ghost built-btn">%s'
+            "</summary>%s</details>"
+            % (files,
+               ('<dl class="kv exposure-kv">%s</dl>' % "".join(facts)) if facts else "",
+               ("<h4>Check it on the machine</h4>%s" % "".join(checks))
+               if checks else "",
+               BUILT_SHOW, inner))
+
 
 # --------------------------------- what other distributions wrote
 # Ports of the functions of the same name in site/app.js.
@@ -945,15 +998,6 @@ def render_page(row, detail, reasons, meta, base_url, now):
                             src(vulns_log(cve),
                                 "Published date source: the vulns.git commit")))
 
-    files_block = ""
-    if detail.get("files"):
-        files_block = ("<h3>Where it lives</h3>"
-                       '<p class="panel-note">The fix touches these files. If the '
-                       "subsystem is one you do not use, the practical exposure is "
-                       "lower, though the package is still the vulnerable one.</p>"
-                       '<p class="files">%s</p>'
-                       % "<br />".join(esc(f) for f in detail["files"]))
-
     up_rows = upstream_rows(detail)
     upstream_block = ""
     if up_rows:
@@ -1015,11 +1059,8 @@ def render_page(row, detail, reasons, meta, base_url, now):
       Debian urgency: {urgency}.</p>
   </section>
 
-  <section class="panel" id="exposure">
-    <div class="detail">{exposure_block}</div>
-  </section>
-
   <section class="panel" id="status">
+    {not_built_line}
     <h2 class="panel-h">What to do, per Debian release</h2>
     <p class="panel-note">Debian's own status for {cve} in every release this site
       tracks, and what each one means in practice. Every status below is the one the
@@ -1040,7 +1081,7 @@ def render_page(row, detail, reasons, meta, base_url, now):
       <div>
         <h3>What the bug is</h3>
         <p class="desc">{description_text}</p>
-        {files_block}
+        {where_block}
         <div class="linkrow">{links}</div>
       </div>
       <div>
@@ -1101,11 +1142,10 @@ def render_page(row, detail, reasons, meta, base_url, now):
         urgency=esc(row.get("urg") or "not yet assigned"),
         urgency_dd=urgency_dd,
         answer_rows=answer_rows(row, detail, meta),
-        exposure_block=exposure_block(row, detail, meta, "h2",
-                                      ' class="panel-h"'),
+        not_built_line=not_built_line(row, meta),
+        where_block=where_block(row, detail, meta),
         notes_block=notes_block(row, detail, meta, "h2", ' class="panel-h"'),
         description_text=esc(detail.get("desc") or "No description published."),
-        files_block=files_block,
         links="".join(ext_link(u, t) for t, u in links),
         kev_box=kev_box(detail),
         cvss_dd=cvss_dd,

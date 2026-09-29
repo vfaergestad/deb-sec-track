@@ -721,6 +721,12 @@ function wireControls() {
     if (btn) toggleReasons(btn);
   });
 
+  // Same reasoning for the build-detail control in "Where it lives".
+  $('#tbody').addEventListener('click', (e) => {
+    const btn = e.target.closest('button.built-btn');
+    if (btn) toggleBuilt(btn);
+  });
+
   $('#copy-stars').addEventListener('click', onCopyStars);
 
   $('#exit-shared').addEventListener('click', () => {
@@ -1222,6 +1228,12 @@ function exposureShape(r) {
 
 const relCount = (n) => n + ' release' + (n === 1 ? '' : 's');
 
+/* The sentence that answers the whole question when Debian compiles the code
+ * into nothing it ships.  It is written once and used twice: in the lead
+ * below, and on its own above the per-release table, which is the only place
+ * an exposure answer is allowed to outrank that table. */
+const NOT_BUILT_HEAD = 'Debian does not build this code.';
+
 /* The one sentence at the top of the panel.  Every clause in it is read off
  * the letters above; where a release could not be established it says so
  * rather than counting it either way. */
@@ -1237,7 +1249,7 @@ function exposureLead(sh) {
       'never as absent.';
   }
   if (sh.shape === 'none') {
-    return '<b>Debian does not build this code.</b> In ' +
+    return '<b>' + NOT_BUILT_HEAD + '</b> In ' +
       relCount(sh.none.length) + ' below, every kernel flavour Debian ' +
       'publishes has the switch off, so the vulnerable file is compiled into ' +
       'no kernel binary Debian ships.' + gap;
@@ -1345,7 +1357,29 @@ function configCommand(syms) {
  * the string an admin types rather than the object name kbuild used. */
 const lsmodName = (mod) => String(mod || '').replace(/-/g, '_');
 
-function exposureBlock(r, d) {
+/* The labels on the disclosure that holds the per-release build detail.  Same
+ * control as the CVSS reasoning below it: a real button that names what it
+ * will show, so the page has one way of hiding detail rather than two. */
+const BUILT_SHOW = 'Show whether Debian builds this, per release';
+const BUILT_HIDE = 'Hide the per-release build detail';
+
+/* The one exposure state that ends the question rather than informing it, so
+ * the only one allowed above the per-release table.  Everything else about
+ * how Debian builds the code is supporting detail and sits in "Where it
+ * lives" below, where it does not compete with the answer. */
+function notBuiltLine(r) {
+  if (exposureShape(r).shape !== 'none') return '';
+  return '<p class="not-built"><b>' + NOT_BUILT_HEAD + '</b> ' +
+    '<span class="dim">The per-release build detail is under "Where it ' +
+    'lives" below.</span></p>';
+}
+
+/* Where the vulnerable code lives and whether Debian compiles it are one
+ * subject, so they are one section.  What stays visible is what a reader acts
+ * on: the files, the subsystem, the module name and the commands to type.
+ * The per-release letters, the Kconfig chain and the prose behind them are
+ * true but not decisive, so they start closed. */
+function whereBlock(r, d) {
   const sh = exposureShape(r);
   const e = d.exposure || {};
   const m = d.maintainers ||
@@ -1382,8 +1416,12 @@ function exposureBlock(r, d) {
       'module, so finding ' + esc(lsmodName(e.mod)) + ' in lsmod would say ' +
       'nothing about this CVE.</span></dd>');
   }
+
+  // The switch names are what the grep above already spells out, so the chain
+  // itself is a re-reading of the command rather than a second instruction.
+  const deepFacts = [];
   if (syms.length) {
-    facts.push('<dt>Build switch' + (syms.length === 1 ? '' : 'es') +
+    deepFacts.push('<dt>Build switch' + (syms.length === 1 ? '' : 'es') +
       '</dt><dd class="mono">' +
       syms.map((s) => esc('CONFIG_' + s)).join(', ') +
       '</dd>' +
@@ -1431,27 +1469,46 @@ function exposureBlock(r, d) {
       'tree. That is a gap in this lookup, not a finding that the code is absent.</p>'
     : '';
 
-  const aside =
-    (facts.length ? '<dl class="kv exposure-kv">' + facts.join('') + '</dl>' : '') +
-    (checks.length ? '<h4>Check it on the machine</h4>' + checks.join('') : '');
-
-  return '<section class="exposure x-' + sh.shape + '">' +
-    '<h3>Does this reach the machine in front of you?</h3>' +
+  const inner =
     '<p class="exposure-lead">' + exposureLead(sh) + '</p>' +
-    // With nothing known about the code there is no second column, and a
-    // half-empty grid would read as something failing to load.
-    (aside ? '<div class="exposure-grid">' : '<div>') + '<div>' +
-      exposureReleases(r, d, sh) +
-      gapNote +
-      '<p class="panel-note">From the configuration Debian publishes for every ' +
-      'kernel flavour it builds. It covers only the architectures Debian ships ' +
-      'a <span class="mono">linux-config</span> package for, and nothing about ' +
-      'a kernel you built yourself. Debian\'s own status below stays ' +
-      'authoritative about the source package.' +
-      (cites.length ? '<span class="srcline">' + cites.join(' ') + '</span>' : '') +
-      '</p>' +
-    '</div>' + (aside ? '<div>' + aside + '</div>' : '') +
-    '</div></section>';
+    exposureReleases(r, d, sh) +
+    gapNote +
+    (deepFacts.length ? '<dl class="kv exposure-kv">' + deepFacts.join('') + '</dl>' : '') +
+    '<p class="panel-note">From the configuration Debian publishes for every ' +
+    'kernel flavour it builds. It covers only the architectures Debian ships ' +
+    'a <span class="mono">linux-config</span> package for, and nothing about ' +
+    'a kernel you built yourself. Debian\'s own status above stays ' +
+    'authoritative about the source package.' +
+    (cites.length ? '<span class="srcline">' + cites.join(' ') + '</span>' : '') +
+    '</p>';
+
+  const id = 'built-' + r.id;
+  const files = (d.files && d.files.length)
+    ? '<p class="panel-note">The fix touches these files. If the subsystem ' +
+      'is one you do not use, the practical exposure is lower, though the ' +
+      'package is still the vulnerable one.</p>' +
+      '<p class="files">' + d.files.map(esc).join('<br>') + '</p>'
+    : '';
+
+  if (!files && !facts.length && !checks.length && !sh.seen.length) return '';
+
+  return '<h3>Where it lives</h3>' + files +
+    (facts.length ? '<dl class="kv exposure-kv">' + facts.join('') + '</dl>' : '') +
+    (checks.length ? '<h4>Check it on the machine</h4>' + checks.join('') : '') +
+    '<button type="button" class="ghost built-btn" aria-expanded="false" ' +
+      'aria-controls="' + esc(id) + '">' + BUILT_SHOW + '</button>' +
+    '<div class="built-out" id="' + esc(id) + '" hidden>' + inner + '</div>';
+}
+
+/* Nothing is fetched here, so the panel is built with the section and the
+ * control only shows and hides it. */
+function toggleBuilt(btn) {
+  const out = document.getElementById(btn.getAttribute('aria-controls'));
+  if (!out) return;
+  const opening = out.hidden;
+  out.hidden = !opening;
+  btn.setAttribute('aria-expanded', opening ? 'true' : 'false');
+  btn.textContent = opening ? BUILT_HIDE : BUILT_SHOW;
 }
 
 /* ------------------------------------------- what other distributions wrote */
@@ -1635,7 +1692,7 @@ function detailHtml(r, d) {
 
   return '<div class="detail">' +
     '<div class="detail-tools">' + starHtml(r.id, true) + '</div>' +
-    exposureBlock(r, d) +
+    notBuiltLine(r) +
     '<h3>What to do, per Debian release</h3>' +
     '<p class="panel-note">Every status below is the one the Debian Security Team ' +
       'publishes for this CVE. ' +
@@ -1647,13 +1704,7 @@ function detailHtml(r, d) {
     '<div class="detail-grid"><div>' +
       '<h3>What the bug is</h3>' +
       '<p class="desc">' + esc(d.desc || 'No description published.') + '</p>' +
-      (d.files && d.files.length
-        ? '<h3>Where it lives</h3>' +
-          '<p class="panel-note">The fix touches these files. If the subsystem ' +
-          'is one you do not use, the practical exposure is lower, though the ' +
-          'package is still the vulnerable one.</p>' +
-          '<p class="files">' + d.files.map(esc).join('<br>') + '</p>'
-        : '') +
+      whereBlock(r, d) +
       '<div class="linkrow">' +
         links.map(([t, u, external]) => (external
           ? ext(u, t, '')
